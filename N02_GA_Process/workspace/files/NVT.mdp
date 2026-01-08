@@ -1,0 +1,71 @@
+;;;;
+integrator               = md
+dt                       = 0.005
+nsteps                   = 40000000 ; 200 ns
+nstcomm                  = 10000
+comm-mode = Linear
+comm-grps                = system
+energygrps               = 
+
+nstxout                  = 10000
+nstvout                  = 10000
+nstfout                  = 10000
+nstlog                   = 10000 
+nstenergy                = 10000
+nstxout-compressed       = 10000
+compressed-x-grps        = system
+
+cutoff-scheme            = Verlet
+nstlist                  = 30
+ns-type                  = grid
+pbc                      = xyz
+verlet-buffer-tolerance  = 0.005
+
+coulombtype              = Cut-off
+table-extension          = 20 
+coulomb-modifier         = Potential-shift-verlet
+rcoulomb                 = 1.5
+epsilon-r                = 15  
+vdw-type                 = cutoff  
+vdw-modifier             = Force-switch         
+rvdw                     = 1.5
+rvdw-switch    		 = 1.3
+rlist		       	 = 1.5
+
+tcoupl                   = Nose-Hoover
+tau-t                    = 0.2 0.2 
+ref-t                    = 453  453
+tc-grps                  = SIV  notSIV
+;Pcoupl                   = parrinello-rahman 
+;Pcoupltype               = isotropic
+;tau-p                    = 20.0   ;parrinello-rahman is more stable with larger tau-p, DdJ, 20130422
+;compressibility          = 4.5e-5
+;ref-p                    = 200.0  
+continuation 	           = yes 
+
+gen-vel                  = no 
+
+lincs-iter	 	  = 2
+constraints              = all-bonds  
+constraint-algorithm     = lincs 
+lincs-order 		     = 16
+
+; NMR refinement stuff
+; Distance restraints type: No, Simple or Ensemble
+disre                    = Simple
+; Force weighting of pairs in one distance restraint: Conservative or Equal
+disre-weighting          = Conservative
+; Use sqrt of the time averaged times the instantaneous violation
+disre-mixed              = no
+disre-fc                 = 0.05
+disre-tau                = 500
+; Output frequency for pair distances to energy file
+nstdisreout              = 0
+; Orientation restraints: No or Yes
+orire                    = No
+; Orientation restraints force constant and tau for time averaging
+orire-fc                 = 0
+orire-tau                = 0
+orire-fitgrp             = system
+; Output frequency for trace(SD) and S to energy file
+nstorireout              = 0

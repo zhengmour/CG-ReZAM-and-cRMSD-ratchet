@@ -1,0 +1,7 @@
+TITLE     SIV
+REMARK    THIS IS A SIMULATION BOX
+CRYST1  104.000  104.000  104.000  90.00  90.00  90.00 P 1           1
+MODEL        1
+ATOM      1  TW    W     1      52.000  52.000  52.000  1.00  0.00            
+TER
+ENDMDL

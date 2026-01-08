@@ -1,0 +1,11 @@
+{
+  "files.associations": {
+    "*.py": "python",
+    "*.cpp": "cpp",
+    "vector": "cpp",
+    "mutex": "cpp",
+    "algorithm": "cpp",
+    "random": "cpp",
+    "thread": "cpp"
+  }
+}

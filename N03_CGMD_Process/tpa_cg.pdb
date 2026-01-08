@@ -1,0 +1,11 @@
+TITLE     single molecule of TPA
+REMARK    THIS IS A SIMULATION BOX
+CRYST1   50.000   50.000   50.000  90.00  90.00  90.00 P 1           1
+MODEL        1
+ATOM      1  C1  TPA     1       2.662   0.000  -1.882  1.00  0.00            
+ATOM      2  C2  TPA     1      -2.662   0.000  -1.882  1.00  0.00            
+ATOM      3  C3  TPA     1       0.000   2.662   1.882  1.00  0.00            
+ATOM      4  C4  TPA     1       0.000  -2.662   1.882  1.00  0.00            
+ATOM      5  N1  TPA     1       0.000   0.000   0.000  1.00  0.00            
+TER
+ENDMDL

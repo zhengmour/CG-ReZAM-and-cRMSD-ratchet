@@ -1,0 +1,112 @@
+units real
+atom_style full
+atom_modify map yes
+neighbor 2.0 bin
+
+read_data	lmp.data extra/bond/per/atom 5 extra/special/per/atom 15 
+                 
+group SIV type 1 2 3 
+group TPA type 4 5
+group SI type 1 
+group other subtract all SIV
+neigh_modify every 1 delay 0 check yes # exclude molecule/intra SIV
+
+# SIVIA
+mass 1 28.0000	# SN1dq:Si
+mass 2  9.0000  # SP:	DO[1-4]
+mass 3  1.0000  # V:	V[X|Y][1-2]
+
+# TPA
+mass 4 29.061   # TC3q:	C[1-4]
+mass 5 70.114   # N2q:	N1
+
+# NA+ BR WT WD
+mass 6 36.0000  # TQ5:	NA+
+mass 7 79.9000  # SQ4:	BR
+mass 8 72.0000  # TW:	W
+
+pair_style hybrid/overlay lj/gromacs/coul/gromacs 9.0 12.0  lennard/mdf 9.0 12.0  coul/long 12.0 
+
+pair_coeff  1 1       lj/gromacs/coul/gromacs 2.6124  2.71724
+pair_coeff  1 2       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  1 3       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  1 4       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  1 5       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  1 6       lj/gromacs/coul/gromacs 0.0000  0.000 
+pair_coeff  1 7       lj/gromacs/coul/gromacs 1.4871  4.100
+pair_coeff  1 8       lj/gromacs/coul/gromacs 0.5139  3.780
+
+pair_coeff  2 2       lj/gromacs/coul/gromacs 27.332 0.91222  
+pair_coeff  2 3       coul/long
+pair_coeff  2 3       lennard/mdf             11273.4 0.000
+pair_coeff  2 4       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  2 5       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  2 6       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  2 7       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  2 8       lj/gromacs/coul/gromacs 0.0000  0.000
+
+pair_coeff  3 3       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  3 4       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  3 5       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  3 6       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  3 7       lj/gromacs/coul/gromacs 0.0000  0.000
+pair_coeff  3 8       lj/gromacs/coul/gromacs 0.0000  0.000
+
+pair_coeff  4 4       lj/gromacs/coul/gromacs 0.4230  3.400
+pair_coeff  4 5       lj/gromacs/coul/gromacs 0.5975  3.950
+pair_coeff  4 6       lj/gromacs/coul/gromacs 0.5609  3.850
+pair_coeff  4 7       lj/gromacs/coul/gromacs 0.5839  3.780
+pair_coeff  4 8       lj/gromacs/coul/gromacs 0.3513  3.510
+
+pair_coeff  5 5       lj/gromacs/coul/gromacs 0.9704  4.700
+pair_coeff  5 6       lj/gromacs/coul/gromacs 2.1432  3.950
+pair_coeff  5 7       lj/gromacs/coul/gromacs 1.5186  4.300
+pair_coeff  5 8       lj/gromacs/coul/gromacs 0.6381  3.950
+
+pair_coeff  6 6       lj/gromacs/coul/gromacs 0.2629  3.570
+pair_coeff  6 7       lj/gromacs/coul/gromacs 0.8126  3.730
+pair_coeff  6 8       lj/gromacs/coul/gromacs 2.1625  3.450
+
+pair_coeff  7 7       lj/gromacs/coul/gromacs 0.8819  4.100
+pair_coeff  7 8       lj/gromacs/coul/gromacs 1.4108  3.780
+
+pair_coeff  8 8       lj/gromacs/coul/gromacs 0.6692  3.500
+
+kspace_style pppm/cg 1.0e-4 1.0e-5
+dielectric 	15.0
+special_bonds   lj  0.0   1.0   0.5
+
+bond_style	harmonic
+angle_style 	harmonic
+# SIV
+bond_coeff      1       3585 1.03171
+bond_coeff      2       3585 2.32650 
+bond_coeff      3       3585 1.69000
+
+# SIV
+angle_coeff     1       3585 0.0
+
+# TPA
+bond_coeff      4       12500 3.2446
+
+# TPA
+angle_coeff     2       4.9474 109.47
+
+# Temporary Bond For AB-AB
+bond_coeff      5       3585 1.050
+
+# shake for SIV
+fix 	rigid SIV shake 0.0001 20 1000 b 2  
+minimize 1.0e-2 1.0e-3 100 1000
+
+dump            1 all custom 1000 lmp.lammpstrj id mol type q x y z 
+fix	    	    mynvt_SIV SIV nvt temp 453.0 453.0 100.0 
+fix           mynpt_other other npt temp 453.0 453.0 100.0 iso 200.0 200.0 1000.0 
+fix 		move all momentum 1 linear 1 1 1
+
+thermo_style custom step temp press ke pe epair etotal
+timestep  0.50
+thermo    1000
+
+run 1000000
+

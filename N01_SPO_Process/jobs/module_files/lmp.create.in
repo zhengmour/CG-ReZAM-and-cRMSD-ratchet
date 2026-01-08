@@ -1,0 +1,183 @@
+units real
+atom_style full
+atom_modify map array
+neighbor 2.0 bin
+
+region mybox block 0 70 0 70 0 70 units box
+create_box 10 mybox bond/types 4 angle/types 2 extra/bond/per/atom 15 extra/angle/per/atom 10 extra/special/per/atom 10 
+                 
+group SIV type 1 2 3 4 5 6
+group SI type 1 
+group other subtract all SIV
+neigh_modify every 1 delay 0 check yes exclude molecule/intra SIV
+molecule        sivmol SIV.mol 
+molecule        sinmol SIN.mol 
+molecule        sibmol SIB.mol 
+molecule        si2bmol SI2B.mol 
+molecule        si3bmol SI3B.mol 
+molecule        sibnmol SIBN.mol 
+molecule        tpamol TPA.mol 
+molecule        namol Na.mol 
+molecule        brmol Br.mol 
+molecule        wmol  W.mol 
+
+create_atoms    0 random 20 9090 mybox mol sivmol 9567 units box overlap 1.2
+create_atoms    0 random 50 9090 mybox mol sinmol 9567 units box overlap 1.2
+create_atoms    0 random 40 9090 mybox mol sibmol 9567 units box overlap 1.2
+create_atoms    0 random 30 9090 mybox mol si2bmol 9567 units box overlap 1.2
+create_atoms    0 random 10 9090 mybox mol si3bmol 9567 units box overlap 1.2
+create_atoms    0 random 50 9090 mybox mol sibnmol 9567 units box overlap 1.2
+create_atoms    0 random 20 9090 mybox mol tpamol 9567 units box overlap 1.2
+create_atoms    0 random 200 9090 mybox mol namol 9567 units box overlap 2.5
+create_atoms    0 random 220 9090 mybox mol brmol 9567 units box overlap 2.5
+create_atoms    0 random 4000 9090 mybox mol wmol 9567 units box overlap 2.0
+
+# SIVIA
+mass 1 28.0000	# SN1dq:Si
+mass 2  9.0000  # AS:	activate free   DO[1-4]
+mass 3  9.0000  # AB:	activate band   DO[1-4]
+mass 4  9.0000	# U:	unactivate      DO[1-4]
+mass 5  1.0000  # V:	V[X|Y][1-2]
+
+# TPA
+mass 6 29.061   # TC3q:	C[1-4]
+mass 7 70.114   # N2q:	N1
+
+# NA+ BR WT WD
+mass 8 36.0000  # TQ5:	NA+
+mass 9 79.9000 # SQ4:	BR
+mass 10 72.0000 # TW:	W
+
+#pair_style hybrid/overlay lj/gromacs 9.0 12.0  lennard/mdf 9.0 12.0  sw/angle/table
+#pair_style hybrid/overlay lj/gromacs 9.0 12.0  lennard/mdf 9.0 12.0 yukawa 1.80 12.0
+pair_style hybrid/overlay zero 12.0 full lj/gromacs/coul/gromacs 9.0 12.0  lennard/mdf 9.0 12.0  coul/long 12.0 yukawa 1.80 12.0 # gauss/cut 12.0
+
+pair_coeff  * * zero
+
+#pair_coeff  1   1     lj/gromacs/coul/gromacs   2.2062  2.717
+pair_coeff  1 1     lj/gromacs/coul/gromacs   1.4871  2.717
+pair_coeff	1	2	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	1	3	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	1	4	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	1	5	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	1	6	    lj/gromacs/coul/gromacs	0.5043	3.650
+pair_coeff	1	7	    lj/gromacs/coul/gromacs	0.8580	4.300
+pair_coeff	1	8     lj/gromacs/coul/gromacs	1.6769	3.100  
+pair_coeff	1	9	    lj/gromacs/coul/gromacs	1.4871	4.100
+pair_coeff	1	10	  lj/gromacs/coul/gromacs	0.5139	3.780
+
+pair_coeff  2 2     yukawa                    1107.0              # AS-AS，阴离子之间纯排斥相互作用
+pair_coeff	2	3	    coul/long
+pair_coeff  2 3     lennard/mdf		        1000.0  0.000       # AS-AB，g(r)，骨架O和O-相互作用
+pair_coeff  2 4     lj/gromacs/coul/gromacs   0.9608  2.272       # AS-US, g(r)，氢键相互作用距离，4.020kJ/mol，2.55A
+pair_coeff	2	5	    coul/long
+pair_coeff	2	5	    lennard/mdf		        11273.4	0.000
+pair_coeff	2	6	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	2	7	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	2	8	    lj/gromacs/coul/gromacs	0.8962	2.094       # 3.75kJ/mol	  
+pair_coeff	2	9 	  lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	2	10	  lj/gromacs/coul/gromacs	0.0000	0.000
+
+# pair_coeff  3   3     gauss/cut 0.0000 3.0 0.2
+pair_coeff  3 3     lj/gromacs/coul/gromacs   28.6806 0.91222     # AB-AB, 强的成键相互作用
+pair_coeff  3 4     lj/gromacs/coul/gromacs   0.2390  2.673       # AB-US，g(r)，骨架O和OH相互作用，1.0kJ/mol，3.0A
+pair_coeff	3	5	    coul/long
+pair_coeff	3	5	    lennard/mdf		        11273.4	0.000
+pair_coeff	3	6	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	3	7	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	3	8	    lj/gromacs/coul/gromacs	0.8962	2.094	  
+pair_coeff	3	9 	  lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	3	10	  lj/gromacs/coul/gromacs	0.0000	0.000
+
+pair_coeff  4 4     lj/gromacs/coul/gromacs   0.5449  2.539       # US-US, g(r)，氢键相互作用距离，2.280kJ/mol，2.85A
+pair_coeff	4	5	    coul/long
+pair_coeff	4	5	    lennard/mdf		        11273.4	0.000
+pair_coeff	4	6	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	4	7	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	4	8	    lj/gromacs/coul/gromacs	0.3609	2.272	    # 1.51kJ/mol
+pair_coeff	4	9 	  lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	4	10	  lj/gromacs/coul/gromacs	0.0000	0.000
+
+pair_coeff	5	5	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	5	6	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	5	7	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	5	8	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	5	9	    lj/gromacs/coul/gromacs	0.0000	0.000
+pair_coeff	5	10	  lj/gromacs/coul/gromacs	0.0000	0.000
+
+pair_coeff	6	6	    lj/gromacs/coul/gromacs	0.4230	3.400
+pair_coeff	6	7	    lj/gromacs/coul/gromacs	0.5975	3.950
+pair_coeff	6	8	    lj/gromacs/coul/gromacs	0.7830	3.940
+pair_coeff	6	9	    lj/gromacs/coul/gromacs	0.7376	4.100
+pair_coeff	6	10	  lj/gromacs/coul/gromacs	0.3513	3.510
+
+pair_coeff	7	7	    lj/gromacs/coul/gromacs	0.9704	4.700
+pair_coeff	7	8	    lj/gromacs/coul/gromacs	2.1432	3.950
+pair_coeff	7	9	    lj/gromacs/coul/gromacs	1.5186	4.300
+pair_coeff	7	10	  lj/gromacs/coul/gromacs	0.6381	3.950
+
+pair_coeff	8	8	    lj/gromacs/coul/gromacs	0.2820	3.540
+pair_coeff	8	9	    lj/gromacs/coul/gromacs	0.8126	3.730
+pair_coeff	8	10	  lj/gromacs/coul/gromacs	2.1625	3.450
+
+pair_coeff	9	9	    lj/gromacs/coul/gromacs	0.9751	4.100
+pair_coeff	9	10	  lj/gromacs/coul/gromacs	1.4108	3.780
+
+pair_coeff	10	10	lj/gromacs/coul/gromacs	0.6692	3.500
+
+# three-body interaction
+# pair_coeff      * * sw/angle/table siv.sw Si NULL NULL NULL NULL NULL NULL NULL NULL NULL
+
+kspace_style pppm/cg 1.0e-4 1.0e-5
+dielectric 	15.0
+special_bonds   lj  1.0  1.0  0.0
+
+bond_style	harmonic
+angle_style 	harmonic	
+# SIV
+bond_coeff	1	3585 1.03171
+bond_coeff      2	3585 2.3265
+bond_coeff	3	3585 1.69000
+
+# SIV
+angle_coeff	1	3585 0.0
+
+# TPA
+bond_coeff	4	12524 3.2446
+
+# TPA
+#angle_coeff	2	4.9474 109.47
+angle_coeff	2	200 109.47
+
+
+# 100 minimize
+#fix 	freeze SIV setforce 0. 0. 0.
+#minimize  1.0e-4 1.0e-6 1000 1000
+#run	0
+#unfix	freeze
+#write_data  min.data
+#reset_timestep 0
+
+# 重新将TPA角度参数修改为正确的
+angle_coeff	2	4.9474 109.47
+# keep SIV rigid
+variable        tfac equal 5.0/3.0 # (3 trans + 2 rot)/(3 trans)
+fix		rigid SIV rigid/nvt/small molecule mol sivmol temp 453.0 453.0 25.0
+fix_modify      rigid dynamic/dof yes
+
+#fix	    	mynpt other npt temp 453.0 453.0 25.0 iso 20.0 20.0 200.0
+#fix_modify 	mynpt dynamic/dof yes
+
+fix	    	mynvt other nvt temp 453.0 453.0 25.0 dilate all 
+fix_modify 	mynvt dynamic/dof yes
+# 消除整体平动
+fix 		move all momentum 1 linear 1 1 1
+
+thermo_style custom step temp press ke pe epair etotal
+timestep  0.10
+thermo    100
+
+run	100
+write_data	lmp.data
+
+

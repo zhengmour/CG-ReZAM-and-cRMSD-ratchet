@@ -1,0 +1,14 @@
+tolerance 2.0
+output init.pdb
+filetype pdb
+structure stella8_mono.pdb
+  number 1000
+  inside box 0. 0. 0. 100 100 100
+  radius 1.5
+end structure
+structure w_cg.pdb
+  number 15400
+  inside box 0. 0. 0. 100 100 100
+end structure
+
+

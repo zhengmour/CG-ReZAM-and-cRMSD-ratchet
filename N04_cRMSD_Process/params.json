@@ -1,0 +1,41 @@
+{
+    "Simulation_Type": "CGMD",
+    "Simulation_Parameters" : {
+        "niterations" : 100,
+        "init_iter" : 0,
+        "init_time" : 0,
+        "time_step" : 0.2, 
+        "nvt_steps" : 20000,
+        "npt_steps" : 0,
+        "occurred_event_number" : 5,
+        "reaction_region_size"  : 7.5, 
+        "minimize_region_size"  : 9.0 
+    },
+
+    "Thermodynamic_Parameters" : {
+        "temperature"  : 453.0,
+        "pressure"     : 200.0
+    },
+
+    "Enhance_Sampling" : {
+        "PIRMSD": {
+            "status" : true,
+            "center" : {
+                "status": true,
+                "alpha": 0.25,
+                "scale_factor": 0.9
+            },
+            "search_clusters" : false,
+            "k" : 50.0,
+            "rmsd_scale": 1.0,
+            "md_steps" : 10,
+            "niterations": 100,
+            "relax_steps": 10000,
+            "refer_structure" :  "zsm.xyz",
+            "fixed_rotate": true,
+            "critical_rmsd" : 9.0,
+            "beta" : 5.0,
+            "output_iteration": 10
+        }
+    }
+}

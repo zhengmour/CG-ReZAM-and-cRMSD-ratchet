@@ -1,0 +1,56 @@
+; Q Prop.
+#define Q_MASS      28.0
+#define Q_CHARGE    0.0
+#define C12_Q_Q     0.00           
+#define C6_Q_Q      0.00
+#define C12_Q_Qa    0.00            
+#define C6_Q_Qa     0.00
+#define C12_Q_C1    0.00           
+#define C6_Q_C1     0.00
+;________________________________
+; Dummy Prop.
+#define DW_MASS     09.0
+#define DX_MASS     09.0
+#define DY_MASS     09.0
+#define DZ_MASS     09.0
+#define DW_CHARGE   0.00
+#define DX_CHARGE   0.00
+#define DY_CHARGE   0.00
+#define DZ_CHARGE   0.00
+#define D_Q_LENGTH  0.103171
+#define D_D_LENGTH  0.169 
+#define D_Q_Kb      1.25E+5
+#define D_D_Kb      1.25E+5
+; D-D Intra.
+#define D_C12       0.00    
+#define D_C6        0.00  
+; D-D Inter.
+#define C12_D_D     1.593390E-10
+#define C6_D_D      2.765551E-04
+; D-Qsi Inter.
+#define C12_D_Q     0           
+#define C6_D_Q      0  
+;________________________________
+; Virtual Site Prop.
+#define VW_CHARGE   0.00
+#define VX_CHARGE   0.00
+#define VY_CHARGE   0.00
+#define VZ_CHARGE   0.00
+#define VW_LENGTH   0.23265
+#define VX_LENGTH   0.23265
+#define VY_LENGTH   0.23265
+#define VZ_LENGTH   0.23265
+#define VS_ANG      0
+#define VS_C12      0.00
+#define VS_C6       0.00
+; VS-D Inter.
+#define C12_VS_D    0 
+#define C6_VS_D     0 
+#define VS_D_REP    0.47417E-7
+;________________________________
+; WATER Prop.
+#define C12_VS_WAT  0.00
+#define C6_VS_WAT   0.00     
+#define C12_D_WAT   0.00
+#define C6_D_WAT    0.00
+;________________________________

@@ -1,0 +1,27 @@
+tolerance 2.0
+output init.pdb
+filetype pdb
+structure stella8_mono.pdb
+  number 2480
+  inside box 0. 0. 0. 170 170 170
+  radius 1.5
+end structure
+structure tpa_cg.pdb
+  number 248
+  inside box 0. 0. 0. 170 170 170
+  radius 2.0
+end structure
+structure na_cg.pdb
+  number 248
+  inside box 0. 0. 0. 170 170 170
+end structure
+structure br_cg.pdb
+  number 496
+  inside box 0. 0. 0. 170 170 170
+end structure
+structure w_cg.pdb
+  number 49600
+  inside box 0. 0. 0. 170 170 170
+end structure
+
+
