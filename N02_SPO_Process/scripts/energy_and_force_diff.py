@@ -23,7 +23,7 @@ def read_forces(dump_file):
     for line in lines[9:]:
         if line:
             words = line.split()
-            if words[1] != 5:
+            if int(words[1]) != 5:
                 data.append([float(x) for x in words[5:8]])
     return np.array(data)
 
@@ -33,7 +33,7 @@ def read_refer_forces(dir, name):
         for line in ff.readlines()[2:]:
             if line:
                 words = line.split()
-                if words[0] != 5:
+                if int(words[0]) != 5:
                     forces.append([float(x) for x in words[1:]])
     return np.array(forces)
 

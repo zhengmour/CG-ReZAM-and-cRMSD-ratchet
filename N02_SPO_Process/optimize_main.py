@@ -1005,29 +1005,32 @@ rm -rf $PART_DIR
 
     def sampling_data(self, sample_size=40000):
         """
-        Randomly sample data directories from all_data_dirs.list to data_dirs.list
-        using 'shuf'. If sample_size <= 0, copy all.
+        Randomly sample data directories from all_data_dirs.list to data_dirs.list.
+        If sample_size <= 0 or exceeds the available data size, copy all entries.
         """
         input_file = self.refer_dir / "all_data_dirs.list"
         output_file = self.refer_dir / "data_dirs.list"
+        if not input_file.exists():
+            raise FileNotFoundError(f"{input_file} does not exist")
 
-        if sample_size > 0:
-            try:
-                # Call shuf and write directly to output file
-                subprocess.run(
-                    ["shuf", "-n", str(sample_size), input_file, "-o", output_file],
-                    check=True,
-                    stderr=subprocess.PIPE,
-                )
-                logging.debug(
-                    f"Randomly sampled file generated: {output_file} (n={sample_size})"
-                )
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Calling shuf failed, stderr: {e.stderr.decode()}")
-        else:
-            subprocess.run(
-                ["cp", input_file, output_file], check=True, stderr=subprocess.PIPE
+        lines = [line for line in input_file.read_text().splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"{input_file} is empty")
+
+        if sample_size > 0 and sample_size < len(lines):
+            rng = np.random.default_rng()
+            selected_indices = np.sort(rng.choice(len(lines), size=sample_size, replace=False))
+            sampled_lines = [lines[i] for i in selected_indices]
+            logging.debug(
+                f"Randomly sampled file generated: {output_file} (n={sample_size})"
             )
+        else:
+            sampled_lines = lines
+            logging.debug(
+                f"Copied all data directories to {output_file} (n={len(sampled_lines)})"
+            )
+
+        output_file.write_text("\n".join(sampled_lines) + "\n")
 
     # -------------------- Automatic weight update --------------------------
 

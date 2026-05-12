@@ -1,25 +1,20 @@
-"""
-1. Draw the simulated Qn distribution, scale the abscissa and compare it with the reference Qn, and return the similarity of the two curves
-https://zhuanlan.zhihu.com/p/610535464
-https://github.com/nelsonwenner/shape-similarity.git
-2. Compare the similarity between the Si-O-Si angular distribution and the reference angular distribution
-3. Si-Si distance distribution and experimental values 3.10. Similarity of reference distribution
+"""Genetic-algorithm driver for CG parameter fitting.
+
+The fitness combines three structural targets extracted from the CG trajectory:
+1. Qn distribution topology landmarks.
+2. Si-D-D-Si angle distribution.
+3. Si-Si distance distribution.
 """
 import sys, os
 import math
 import numpy as np
-from shapesimilarity import shape_similarity
-from sko.PSO import PSO
 from sko.GA import RCGA
 from sko.tools import set_run_mode
 from scripts.aq_info import InfoFile
 import subprocess
 from time import sleep
 
-GPU_SERVER = False
-CPU_SERVER = True
-
-#Valores experimentais de Devreux et al. (q, c)
+# Experimental targets from Devreux et al. in (q, c) space.
 d_max_c       = .9
 d_max_q0      = np.array([1.0, .00])
 d_max_q1      = np.array([.58, .25])
@@ -42,7 +37,7 @@ r_ss = 3.05
 t_sos = 153.0
 k = 100.0
 
-variables = [
+VARIABLE_BOUNDS = [
   # [0.2000, 0.3200], # sigQ
   [2.0, 15.0],        # epsQ
   [0.05, 0.25],     # sigD
@@ -52,7 +47,9 @@ variables = [
 ]
 
 class OptimizeCoeffs():
-  def __init__(self, directory="./workspace", script_path="./scripts", logfile='./optimize.log', gmx_ntomp=64, pool_threads=6, refer_gmx=None, refer_lmp=None):
+  """Coordinate the GA search and submit MD jobs for each candidate."""
+
+  def __init__(self, directory="./workspace", script_path="./scripts", logfile='./optimize.log', gmx_ntomp=64, pool_threads=6):
     self.lfs = None
     self.directory=directory
     self.script_path=script_path
@@ -60,41 +57,38 @@ class OptimizeCoeffs():
     self.gmx_ntomp=gmx_ntomp
     self.pool_threads=pool_threads
 
-    # Whether to use gromacs and reaxff simulation results as a comparison
-    if not refer_gmx is None:
-      self.rfgmx = InfoFile(refer_gmx)
-      self.rfgmx.calc_rdf_qn()
-    else:
-      self.rfgmx = None
-
-    if not refer_lmp is None:
-      self.rflmp = InfoFile(refer_lmp)
-      self.rflmp.calc_rdf_qn()
-    else:
-      self.rflmp = None
-
-  # The number of LFS and RFS nodes must be the same
-  def curve_similarity(self, lfs, rfs, k):
-    shape1 = np.column_stack((lfs[0], lfs[1]))
-    shape2 = np.column_stack((rfs[0], rfs[1]))
-    return k*(1.0-shape_similarity(shape1, shape2))
-
   def numerical_similarity(self, lfv, rfv, k):
     return k*np.linalg.norm(lfv-rfv)
 
-  def log_numerical_similarity(self, lfv, rfv, k):
-    return -k*math.log(np.linalg.norm(lfv-rfv)/2)
+  def _denormalize_coeffs(self, normalized_coeffs):
+    """Map unit-interval GA parameters into the physical coefficient range."""
+    physical_coeffs = []
+    for coeff, bounds in zip(normalized_coeffs, VARIABLE_BOUNDS):
+      physical_coeffs.append(coeff * (bounds[1] - bounds[0]) + bounds[0])
+    physical_coeffs.insert(0, 0.27172)
+    return physical_coeffs
+
+  def _get_latest_slurm_status(self, job_name):
+    """Return the latest Slurm state string, or None if no usable row exists yet."""
+    sacct_output = subprocess.getoutput(
+      "sacct --name {:s} -X -o JobID,JobName%20,State".format(job_name)
+    )
+    with open(self.logfile, 'a') as logf:
+      logf.write("Waiting for {:s} to finish...\n{:s}\n".format(job_name, sacct_output))
+
+    lines = [line.split() for line in sacct_output.splitlines() if line.strip()]
+    for parts in reversed(lines):
+      if len(parts) >= 3 and parts[0] != "JobID":
+        return parts[2]
+    return None
 
   def func(self, coeffs):
-    new_coeffs = []
-    for coeff, variable in zip(coeffs, variables):
-      new_coeffs.append(coeff*(variable[1]-variable[0])+variable[0])
-    new_coeffs.insert(0, 0.27172)
-    fitness = self.run_md(new_coeffs)
+    physical_coeffs = self._denormalize_coeffs(coeffs)
+    fitness = self.run_md(physical_coeffs)
     return fitness
 
   def fitness(self):
-    # r_ss, θ_sos becomes an order of magnitude with qn
+    # Scale structural observables to the same order of magnitude as the Qn terms.
     result_r_ss  = self.numerical_similarity(self.lfs.r_ss/r_ss,   1.0, k)
     result_t_sos = self.numerical_similarity(self.lfs.t_sos/t_sos, 1.0, k)
 
@@ -121,7 +115,7 @@ class OptimizeCoeffs():
     for cross_q0_q4 in self.lfs.cross_q0_q4:  result_cross_q0_q4 += self.numerical_similarity(cross_q0_q4, d_cross_q0_q4, 2*k)
     with open(self.logfile, 'a') as logf:
       logf.write(
-        "*** Infomation of Fitness: \n"
+        "*** Fitness details:\n"
         "r_ss         = {:.2f} {:.2f}\n"
         "t_sos        = {:.2f} {:.2f}\n"
         "max_c        = {:.2f} {:.2f}\n"
@@ -150,36 +144,28 @@ class OptimizeCoeffs():
           result_max_q4+ result_max_q5+ result_cross_q0_q1+ result_cross_q1_q2+ result_cross_q2_q3+ result_cross_q3_q4+ \
           result_cross_q0_q2+ result_cross_q1_q3+ result_cross_q2_q4+ result_cross_q0_q3+ result_cross_q1_q4+ result_cross_q0_q4
 
-    # Comparison with RDF of reference structures
-    if not self.rflmp is None:
-      # result += self.curve_similarity(self.lfs.Tsos, self.rflmp.Tsos)
-      result += self.curve_similarity(self.lfs.Rss , self.rflmp.Rss , k)
-    if not self.rfgmx is None:
-      result += self.curve_similarity(self.lfs.Rsc , self.rfgmx.Rsc , k)
-      result += self.curve_similarity(self.lfs.Rsn , self.rfgmx.Rsn , k)
-      result += self.curve_similarity(self.lfs.Rso , self.rfgmx.Rso , k)
-      result += self.curve_similarity(self.lfs.Rsna, self.rfgmx.Rsna, k)
-
     return result
 
   def run_md(self, coeffs):
-    # coeffs: [sigma_Q, epsion_Q, sigma_D, epsilon_D, d_vs, epsilon_rep]
+    # coeffs: [sigma_Q, epsilon_Q, sigma_D, epsilon_D, d_vs, epsilon_rep]
     path = "{:s}/sigQ_{:010.6f}_epsQ_{:010.6f}_sigD_{:010.6f}_epsD_{:010.6f}_dVS_{:010.6f}_rep_{:010.6e}_lambda_{:010.6f}".format(self.directory, coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5], coeffs[6])
     coeffs_str = "{:010.6f} {:010.6f} {:010.6f} {:010.6f} {:010.6f} {:010.6e} {:010.6f}".format(coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5], coeffs[6])
 
-    # If the folder does not exist, the simulation is performed
+    # Each coefficient set writes to a deterministic folder so repeated
+    # evaluations can reuse an existing finished trajectory.
     if not os.path.exists(path):
-      # Enter the PID of the process as a flag for each task
-      os.system("mkdir {:s}".format(path))
-      p = subprocess.Popen("sbatch --job-name=zd-opt-{:d} --ntasks={:d} -o {:s}/job.%j.out -e {:s}/job.%j.err {:s}/run_gmx.sh {:s} {:s} {:d}".format(
-          os.getpid(), self.gmx_ntomp, path, path, self.script_path, coeffs_str, self.directory, self.gmx_ntomp), shell=True)
+      # Use a deterministic directory name so repeated evaluations can reuse results.
+      os.makedirs(path, exist_ok=True)
+      job_name = "zd-opt-{:d}".format(os.getpid())
+      p = subprocess.Popen("sbatch --job-name={:s} --ntasks={:d} -o {:s}/job.%j.out -e {:s}/job.%j.err {:s}/run_gmx.sh {:s} {:s} {:d}".format(
+          job_name, self.gmx_ntomp, path, path, self.script_path, coeffs_str, self.directory, self.gmx_ntomp), shell=True)
       while True:
         sleep(10)
-        # Use sacct to view the details of the task
-        sacct_output = subprocess.getoutput("sacct --name zd-opt-{:d} -X -o JobID,JobName%20,State".format(os.getpid()))
-        with open(self.logfile, 'a') as logf:
-          logf.write("waiting {:d} completed...\n{:s}\n".format(os.getpid(), sacct_output))
-        status = sacct_output.split('\n')[-1].split()[2]
+        # Poll Slurm until the submitted job reaches a terminal state.
+        status = self._get_latest_slurm_status(job_name)
+        if status is None:
+          sleep(110)
+          continue
         if status.startswith("COMPLETED") or status.startswith("FAILED") or status.startswith("CANCELLED"):
           break
         sleep(110)
@@ -193,22 +179,13 @@ class OptimizeCoeffs():
       fitness = math.inf
 
     with open(self.logfile, 'a') as of:
-      print("=== coeffs ===\n sigQ: {:010.6f}; epsQ: {:010.6f};\n sigD: {:010.6f}; epsD: {:010.6f};\n dVS: {:010.6f}; rep: {:010.6e}\n}".format(coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5]), file=of)
+      print("=== Coefficients ===\nsigQ: {:010.6f}; epsQ: {:010.6f};\nsigD: {:010.6f}; epsD: {:010.6f};\ndVS: {:010.6f}; rep: {:010.6e}\n".format(coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5]), file=of)
       print("*** Fitness: {:f}  ***\n".format(fitness), file=of)
     return fitness
 
-  def optimize_PSO(self, pop_number, max_iter):
-    # https://zhuanlan.zhihu.com/p/346355572
-    # https://scikit-opt.github.io/scikit-opt/#/en/README?id=_3-psoparticle-swarm-optimization
-    # pyPSO、scikit-opt、deap
-    set_run_mode(self.func, 'multiprocessing')
-    pso = PSO(func=self.func, n_dim=6, pop=pop_number, max_iter=max_iter, lb=[0.0, 0.0, 0.0, 0.0, 0.0], ub=[1.0, 1.0, 1.0, 1.0, 1.0], w=0.8, c1=0.5, c2=0.5)
-    pso.run()
-    return pso.gbest_x, pso.gbest_y
-
   def optimize_GA(self, pop_number, max_iter):
     set_run_mode(self.func, 'multiprocessing')
-    ga = RCGA(func=self.func, n_dim=6, size_pop=pop_number, max_iter=max_iter, prob_mut=0.1, prob_cros=0.8, lb=[0.0, 0.0, 0.0, 0.0, 0.0], ub=[1.0, 1.0, 1.0, 1.0, 1.0], n_processes=pop_number)
+    ga = RCGA(func=self.func, n_dim=5, size_pop=pop_number, max_iter=max_iter, prob_mut=0.1, prob_cros=0.8, lb=[0.0, 0.0, 0.0, 0.0, 0.0], ub=[1.0, 1.0, 1.0, 1.0, 1.0], n_processes=pop_number)
     best_x, best_y = ga.run()
     return best_x, best_y
 
@@ -224,10 +201,7 @@ if __name__ == "__main__":
 
   optimize = OptimizeCoeffs(directory=directory, script_path=script_path, logfile=logfile, gmx_ntomp=gmx_ntomp, pool_threads=pool_threads)
   best_coeffs, best_fitness = optimize.optimize_GA(pop_number, max_iter)
-  best_norm_coeffs = []
-  for coeff, variable in zip(best_coeffs, variables):
-    best_norm_coeffs.append(coeff*(variable[1]-variable[0])+variable[0])
-  best_norm_coeffs.insert(0, 0.27172)
+  best_norm_coeffs = optimize._denormalize_coeffs(best_coeffs)
   with open(logfile, 'a') as logf:
     print(best_norm_coeffs, file=logf)
     print(best_fitness, file=logf)

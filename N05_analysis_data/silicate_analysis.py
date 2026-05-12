@@ -20,7 +20,7 @@ def main(file_type: str, n_loop: int, traj_path: str = "./"):
     print("Step 1: Reading topology files...")
     if file_type == 'gro':
         topologies = read_gro_files(traj_path, n_loop)
-    if file_type == 'xtc':
+    elif file_type == 'xtc':
         topologies = read_xtc_files(traj_path, n_loop)
     elif file_type in ['lmp', 'data']:
         topologies = read_data_files(traj_path, n_loop)

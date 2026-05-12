@@ -1,5 +1,5 @@
 #!/home/zhengda/anaconda3/envs/mda/bin/python
-import sys, os
+import os
 import MDAnalysis as mda
 from MDAnalysis.core.groups import AtomGroup
 from MDAnalysis.analysis import distances, rdf
@@ -7,7 +7,7 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.signal import savgol_filter
 from scipy.integrate import simpson
-from scipy.ndimage.filters import median_filter
+from scipy.ndimage import median_filter
 from scipy import interpolate
 import tqdm
 import matplotlib.pyplot as plt
@@ -15,22 +15,23 @@ from multiprocessing import Pool
 from functools import partial 
 import itertools
 
-def str2bool(v):
-  return v.lower() in ("yes", "true", "t", "1")
-
-r0        = 3.07
-theta0    = 151.62
 n_dummies = 4
-cutoff    = 1.6 
 
 class InfoFile():
-  def __init__(self, topfile, trjfile, logfile, pool_threads=4, is_refer=False, is_gmx=True):
-    self.dirname = os.path.dirname(topfile)
+  """Read a trajectory and extract RDF / Qn descriptors used by the GA stage."""
+
+  def __init__(self, topfile, trjfile=None, logfile=None, pool_threads=4, is_refer=None, is_gmx=True):
+    self.dirname = os.path.dirname(topfile) or "."
     self.filename = os.path.basename(topfile).rsplit('.', 2)[0]
-    self.log  = logfile
+    self.log  = logfile or os.path.join(self.dirname, "info.log")
     self.pool_threads = pool_threads
 
-    if isinstance(trjfile, str):
+    if is_refer is None:
+      is_refer = trjfile is None and logfile is None
+
+    if trjfile is None:
+      trjfiles = ()
+    elif isinstance(trjfile, str):
       trjfiles = (trjfile,) 
     else:
       trjfiles = tuple(trjfile)
@@ -40,7 +41,7 @@ class InfoFile():
     self.fqn  = self.dirname+"/condensation_Qn_"+self.filename+'.xvg'
 
     if is_refer:
-      # gromacs
+      # GROMACS reference structure
       if is_gmx:
         self.system = mda.Universe(topfile)
         self.u_Si: AtomGroup = self.system.select_atoms('name Si')
@@ -48,7 +49,7 @@ class InfoFile():
         self.u_C : AtomGroup = self.system.select_atoms('name C')
         self.u_N : AtomGroup = self.system.select_atoms('name N')
         self.u_Na: AtomGroup = self.system.select_atoms("name Na")
-      # lammps
+      # LAMMPS reference structure
       else:
         self.system = mda.Universe(topfile, topology_format='DATA', atom_style='id resid type charge x y z')
         self.u_Si: AtomGroup = self.system.select_atoms('type 1')
@@ -57,6 +58,8 @@ class InfoFile():
         self.u_N : AtomGroup = self.system.select_atoms('type 5')
         self.u_Na: AtomGroup = self.system.select_atoms("type 6")
     else:
+      if trjfile is None:
+        raise ValueError("Trajectory mode requires 'trjfile'.")
       if is_gmx:
         self.system = mda.Universe(topfile, trjfiles)       
         self.u_Si: AtomGroup = self.system.select_atoms('name Si')
@@ -72,14 +75,8 @@ class InfoFile():
         self.u_N : AtomGroup = self.system.select_atoms('type 5')
         self.u_Na: AtomGroup = self.system.select_atoms("type 6")
 
-  def dist_PBC(self, x0, x1, dimensions):
-    # https://stackoverflow.com/questions/11108869/optimizing-python-distance-calculation-while-accounting-for-periodic-boundary-co
-    delta = np.abs(x0 - x1)
-    delta = np.where(delta > 0.5 * dimensions, delta - dimensions, delta)
-    return np.sqrt((delta ** 2).sum(axis=-1))
-
-  # Calculate the angle at which Si-D-D-Si is formed
   def calc_angle(self, si1, d1, si2, d2):
+    """Return the Si-D-D-Si angle in radians."""
     v1 = d1 - si1
     v1_norm = v1.dot(v1)**0.5
     v2 = d2 - si2
@@ -94,7 +91,28 @@ class InfoFile():
       lst[1].append(value)
       print("{:f} {:f}".format(bin, value), file=of)
 
-  def func_sos_qn(self, r_ss, r_dd, index=None):
+  def _get_valid_savgol_window(self, data_length, preferred_window):
+    """Return a valid odd window length for Savitzky-Golay smoothing."""
+    if data_length < 3:
+      return None
+
+    window = min(preferred_window, data_length)
+    if window % 2 == 0:
+      window -= 1
+    if window < 3:
+      return None
+    return window
+
+  def _smooth_curve(self, values, preferred_window, polyorder=1):
+    """Smooth data when enough points are available, else return raw values."""
+    values = np.asarray(values)
+    window = self._get_valid_savgol_window(len(values), preferred_window)
+    if window is None or window <= polyorder:
+      return values
+    return savgol_filter(values, window, polyorder)
+
+  def analyze_frame_qn(self, r_ss, r_dd, index=None):
+    """Analyze one frame and return Tsos values together with Qn fractions."""
     self.system.trajectory[index]
     dims = self.system.dimensions
     si_coords = self.u_Si.positions
@@ -103,7 +121,7 @@ class InfoFile():
     d_mat = distances.contact_matrix(d_coords, cutoff=r_dd, box=dims)
     for i in range(0, len(d_mat), n_dummies):
       d_mat[i:i+n_dummies, i:i+n_dummies] = False
-    # Find the Ds that are close to each other
+    # Find neighboring dummy sites after removing intramolecular pairs.
     nb_dummies = [np.where(ele) for ele in d_mat]
     
     Tsos = []	
@@ -115,11 +133,11 @@ class InfoFile():
           try:
             Tsos.append(self.calc_angle(si_coords[int(np.floor(i/4))], d_coords[i], si_coords[int(np.floor(j/4))], d_coords[int(j)]))
           except Exception as error:
-            print("An error occurred:", type(error).__name__, "–", error)  
+            print("Frame analysis error:", type(error).__name__, "-", error)
 
     Q0 = Q1 = Q2 = Q3 = Q4 = Q5 = 0 
     for ele in si_mat:
-      # Remove autocorrelation
+      # Remove self contacts when counting Qn connectivity.
       Q = np.sum(ele==True) - 1
       if Q == 0:
         Q0 += 1
@@ -139,70 +157,12 @@ class InfoFile():
       return (Tsos, None, Q0/n_atoms, Q1/n_atoms, Q2/n_atoms, Q3/n_atoms, Q4/n_atoms, Q5/n_atoms, C)
     return (Tsos, self.system.trajectory.ts.time, Q0/n_atoms, Q1/n_atoms, Q2/n_atoms, Q3/n_atoms, Q4/n_atoms, Q5/n_atoms, C)
 
-  def calc_rss_rdf(self):
-    self.Rss_rdf = [[],[]]
-    ss_rdf = rdf.InterRDF(self.u_Si, self.u_Si, nbins=500, range=(0.5,15.0))
-    ss_rdf.run()
-    with open(self.fss, 'w') as of:
-      self.write_rdf_xvg(of, self.Rss_rdf, ss_rdf.bins, ss_rdf.rdf, '@    title RDF of Si-Si\n@    xaxis  label "distance"\n@    yaxis  label "RDF"\n'
-          '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')	
-    
-    max_index = np.argmax(ss_rdf.rdf)
-    self.r_ss = ss_rdf.bins[max_index]
-    plt.plot(ss_rdf.bins, ss_rdf.rdf)
-    plt.savefig(self.dirname+"/condensation_Si-Si_"+self.filename+'.png', dpi=1200)
-    plt.cla()
-      
-  def calc_tsos_rdf(self):
-    self.Tsos_rdf = [[],[]]
-    dd_rdf = rdf.InterRDF(self.u_D, self.u_D, nbins=500, range=(0.5,15.0))
-    dd_rdf.run(start=-100)
-    max_value_index = np.argmax(dd_rdf.rdf)
-    self.r_dd = dd_rdf.bins[max_value_index]
-
-    Tsos, t, Q0, Q1, Q2, Q3, Q4, Q5, C = self.func_sos_qn(self.r_ss+0.2, self.r_dd+0.12)
-    Tsos = np.array(Tsos)*180/np.pi
-    hist, bin_edges = np.histogram(Tsos, bins=880, range=(0,220.0))
-    bins = np.mean(np.vstack([bin_edges[:-1], bin_edges[1:]]), axis=0) 
-    with open(self.ftsos, 'w') as of:
-      self.write_rdf_xvg(of, self.Tsos_rdf, bins, hist, '@    title RDF of Si-D-D-Si\n@    xaxis  label "degree"\n@    yaxis  label "RDF"\n'
-          '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')
-
-    plt.plot(bins, hist)
-    plt.savefig(self.dirname+"/condensation_Si-D-D-Si_"+self.filename+'.png', dpi=1200)
-    plt.cla()
-
-    hist_smooth = savgol_filter(hist, 50, 1)
-    peaks,props = find_peaks(hist_smooth,prominence=max(hist_smooth)*0.02)
-    valleys,props = find_peaks(-hist_smooth,prominence=max(hist_smooth)*0.02)
-    peak_intensity = []
-    for peak in peaks:
-      lv = np.array([v for v in valleys if v < peak])
-      if lv.any():
-        lv = np.max(lv)
-      else:
-        lv = 0
-      rv = np.array([v for v in valleys if v > peak])
-      if rv.any():
-        rv = np.min(rv)
-      else:
-        rv = -1
-      peak_intensity.append(simpson(hist_smooth[lv:rv], x=bins[lv:rv]))
-
-    if peak_intensity:
-      max_index = max(enumerate(peak_intensity), key=lambda x: x[1])[0]
-      self.t_sos = bins[peaks[max_index]]
-    else:
-      self.t_sos = 0.00
-    print(self.t_sos)
-
   def calc_rdf(self):
     self.Rss_rdf = [[],[]]
     self.Tsos_rdf = [[],[]]
 
-    # https://docs.mdanalysis.org/2.7.0/documentation_pages/analysis/rdf.html#module-MDAnalysis.analysis.rdf
     with open(self.fss, 'w') as of, open(self.log, 'a') as logf:
-      logf.write("# calc_rdf starting...\n")
+      logf.write("# Starting RDF analysis...\n")
       ss_rdf = rdf.InterRDF(self.u_Si, self.u_Si, nbins=500, range=(0.5,15.0))
       ss_rdf.run(start=-100)
       self.r_ss_rdf = [ss_rdf.bins, ss_rdf.rdf]	
@@ -211,7 +171,7 @@ class InfoFile():
           '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')
       max_index = np.argmax(ss_rdf.rdf)
       self.r_ss = ss_rdf.bins[max_index]
-      logf.write("*** The distance between Si and Si is: tween Si and Si is: {:4.2f}...\n".format(self.r_ss))
+      logf.write("*** Peak Si-Si distance: {:4.2f}\n".format(self.r_ss))
       plt.plot(ss_rdf.bins, ss_rdf.rdf)
       plt.savefig(self.dirname+"/condensation_Si-Si_"+self.filename+'.png', dpi=1200)
       plt.cla()
@@ -226,7 +186,7 @@ class InfoFile():
     start_frame = n_frames - extra_frame
     indices = list(range(start_frame, n_frames))
     with Pool(processes = self.pool_threads) as pool:
-      result = list(tqdm.tqdm(pool.imap(partial(self.func_sos_qn, self.r_ss+0.2, self.r_dd+0.12), indices), total=len(extra_frame)))
+      result = list(tqdm.tqdm(pool.imap(partial(self.analyze_frame_qn, self.r_ss+0.2, self.r_dd+0.12), indices), total=extra_frame))
 
     Tsos_all = []
     q5 = []
@@ -242,7 +202,7 @@ class InfoFile():
       self.write_rdf_xvg(of, self.Tsos_rdf, bins, hist, '@    title RDF of Si-D-D-Si\n@    xaxis  label "degree"\n@    yaxis  label "RDF"\n'
           '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')
 
-      hist_smooth = savgol_filter(hist, 50, 1)
+      hist_smooth = self._smooth_curve(hist, 51)
       peaks,props = find_peaks(hist_smooth,prominence=max(hist_smooth)*0.02)
       valleys,props = find_peaks(-hist_smooth,prominence=max(hist_smooth)*0.02)
       peak_intensity = []
@@ -267,10 +227,10 @@ class InfoFile():
       if peak_intensity:
         max_index = max(enumerate(peak_intensity), key=lambda x: x[1])[0]
         self.t_sos = bins[peaks[max_index]]
-        logf.write("*** Angle of Si-D-D-Si: {:.2f}...\n".format(self.t_sos))
+        logf.write("*** Peak Si-D-D-Si angle: {:.2f}\n".format(self.t_sos))
       else:
         self.t_sos = 0.00
-        logf.write("***ERROR The optimal Si-D-D-Si angle cannot be obtained...\n")
+        logf.write("*** ERROR: unable to determine a peak Si-D-D-Si angle.\n")
     
   def calc_env(self, filename):
     with open(filename, 'r') as rf:
@@ -308,7 +268,7 @@ class InfoFile():
     self.cross_q0_q4 =  []
 
     with open(self.fss, 'w') as of, open(self.log, 'a') as logf:
-      logf.write("# calc_rdf starting...\n")
+      logf.write("# Starting RDF analysis...\n")
       ss_rdf = rdf.InterRDF(self.u_Si, self.u_Si, nbins=500, range=(0.5,15.0))
       ss_rdf.run(start=-100)
       self.r_ss_rdf = [ss_rdf.bins, ss_rdf.rdf]	
@@ -317,7 +277,7 @@ class InfoFile():
           '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')
       max_index = np.argmax(ss_rdf.rdf)
       self.r_ss = ss_rdf.bins[max_index]
-      logf.write("*** The distance between Si and Si is: {:4.2f}...\n".format(self.r_ss))
+      logf.write("*** Peak Si-Si distance: {:4.2f}\n".format(self.r_ss))
       plt.plot(ss_rdf.bins, ss_rdf.rdf)
       plt.savefig(self.dirname+"/condensation_Si-Si_"+self.filename+'.png', dpi=1200)
       plt.cla()
@@ -329,15 +289,15 @@ class InfoFile():
 
     Tsos_all = []
     with open(self.fqn, 'w') as of, open(self.log, 'a') as logf:          
-      print("# Andre Carvalho\n# MolModel Group\n# Universidade de Aveiro\n# andre.dc@ua.pt", file=of)                                                          
+      print("# Andre Carvalho\n# MolModel Group\n# Universidade de Aveiro\n# andre.dc@ua.pt", file=of)
       print('@    title "Silica condensation"\n@    xaxis  label "time"\n@    yaxis  label "qi"\n@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n@ legend on\n@ legend box on\n@ legend loctype view\n@ legend 0.78, 0.8\n@ legend length 2\n@ s0 legend "Q0"\n@ s1 legend "Q1"\n@ s2 legend "Q2"\n@ s3 legend "Q3"\n@ s4 legend "Q4"\n@ s5 legend "Qn"\n@ s6 legend "C"\n@ s0 line color "black"\n@ s1 line color "red"\n@ s2 line color "blue"\n@ s3 line color "magenta"\n@ s4 line color "brown"\n@ s5 line color "yellow"\n@ s6 line color "green"\n', file=of)
       
-      logf.write("# calc_qn starting...\n")
+      logf.write("# Starting Qn analysis...\n")
       
       with Pool(processes = self.pool_threads) as pool:
-        result = list(tqdm.tqdm(pool.imap(partial(self.func_sos_qn, self.r_ss+0.2, self.r_dd+0.12), list(range(len(self.system.trajectory)))), total=len(self.system.trajectory)))
+        result = list(tqdm.tqdm(pool.imap(partial(self.analyze_frame_qn, self.r_ss+0.2, self.r_dd+0.12), list(range(len(self.system.trajectory)))), total=len(self.system.trajectory)))
 
-      logf.write("# Analyze multi-process results...\n")
+      logf.write("# Aggregating per-frame analysis results...\n")
       for Tsos, t, Q0, Q1, Q2, Q3, Q4, Q5, C in result:  
         Tsos_all.append(Tsos)
         times.append(t)
@@ -356,7 +316,7 @@ class InfoFile():
       bins = np.mean(np.vstack([bin_edges[:-1], bin_edges[1:]]), axis=0) 
       self.write_rdf_xvg(of, self.Tsos_rdf, bins, hist, '@    title RDF of Si-D-D-Si\n@    xaxis  label "degree"\n@    yaxis  label "RDF"\n'
           '@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n')
-      hist_smooth = savgol_filter(hist, 50, 1)
+      hist_smooth = self._smooth_curve(hist, 51)
       peaks,props = find_peaks(hist_smooth,prominence=max(hist_smooth)*0.02)
       valleys,props = find_peaks(-hist_smooth,prominence=max(hist_smooth)*0.02)
       peak_intensity = []
@@ -380,10 +340,10 @@ class InfoFile():
       if peak_intensity:
         max_index = max(enumerate(peak_intensity), key=lambda x: x[1])[0]
         self.t_sos = bins[peaks[max_index]]
-        logf.write("*** Angle of Si-D-D-Si: {:.2f}...\n".format(self.t_sos))
+        logf.write("*** Peak Si-D-D-Si angle: {:.2f}\n".format(self.t_sos))
       else:
         self.t_sos = 0.00
-        logf.write("***ERROR The optimal Si-D-D-Si angle cannot be obtained...\n")
+        logf.write("*** ERROR: unable to determine a peak Si-D-D-Si angle.\n")
 
       self.max_c = np.max(c)
       self.max_q0 = np.array([np.max(q0), c[q0.index(np.max(q0))]])
@@ -392,7 +352,7 @@ class InfoFile():
       self.max_q3 = np.array([np.max(q3), c[q3.index(np.max(q3))]]) 
       self.max_q4 = np.array([np.max(q4), c[q4.index(np.max(q4))]]) 
       self.max_q5 = np.array([np.max(q5), c[q5.index(np.max(q5))]])   
-      # Compare with the results obtained by (c,q).
+      # Compare the simulated (c, q) curves across all Qn states.
       plt.plot(c, q0, label='q0')
       plt.plot(c, q1, label='q1')
       plt.plot(c, q2, label='q2')
@@ -435,12 +395,12 @@ class InfoFile():
       q3_filter = median_filter(q3, 10) 
       q4_filter = median_filter(q4, 10)
       q5_filter = median_filter(q5, 10)   
-      q0_smooth = savgol_filter(q0_filter, 10, 1) 
-      q1_smooth = savgol_filter(q1_filter, 10, 1) 
-      q2_smooth = savgol_filter(q2_filter, 10, 1) 
-      q3_smooth = savgol_filter(q3_filter, 10, 1) 
-      q4_smooth = savgol_filter(q4_filter, 10, 1)
-      q5_smooth = savgol_filter(q5_filter, 10, 1)
+      q0_smooth = self._smooth_curve(q0_filter, 11)
+      q1_smooth = self._smooth_curve(q1_filter, 11)
+      q2_smooth = self._smooth_curve(q2_filter, 11)
+      q3_smooth = self._smooth_curve(q3_filter, 11)
+      q4_smooth = self._smooth_curve(q4_filter, 11)
+      q5_smooth = self._smooth_curve(q5_filter, 11)
       plt.plot(c, q0_smooth, label='q0')
       plt.plot(c, q1_smooth, label='q1')
       plt.plot(c, q2_smooth, label='q2')
@@ -511,7 +471,7 @@ class InfoFile():
       self.cross_q1_q4 = np.array(self.cross_q1_q4)
       self.cross_q0_q4 = np.array(self.cross_q0_q4)
 
-      print("*** Some information about the Qn nodes...:\n"
+      print("*** Qn summary:\n"
                     "max_c =  ", self.max_c,  " \n"
                     "max_q0 = ", self.max_q0, " \n"
                     "max_q1 = ", self.max_q1, " \n"
@@ -530,19 +490,25 @@ class InfoFile():
             "cross_q1_q4 = ", self.cross_q1_q4, " \n"
             "cross_q0_q4 = ", self.cross_q0_q4, " \n", file=logf)
 
-  def crossing_points_list(self, X1, Y1, X2, Y2, gname):
-    Y1_smooth = savgol_filter(Y1, 50, 1)
-    Y2_smooth = savgol_filter(Y2, 50, 1)
+  def find_crossing_points(self, X1, Y1, X2, Y2, gname):
+    """Smooth two curves and return their intersections."""
+    Y1_smooth = self._smooth_curve(Y1, 51)
+    Y2_smooth = self._smooth_curve(Y2, 51)
     
     plt.plot(X1, Y1_smooth)
     plt.plot(X2, Y2_smooth)
     plt.savefig(self.dirname+"/condensation_" + gname + '_' + self.filename+'.png', dpi=1200)
     plt.cla()
 
-    X, Y = self.numpy_scipy_find_inersections_by_X1Y1X2Y2(X1, Y1_smooth, X2, Y2_smooth)
+    X, Y = self.find_intersections_from_curves(X1, Y1_smooth, X2, Y2_smooth)
     return np.array([[x, y] for x, y in zip(X, Y)])      
 
-  def numpy_scipy_find_inersections_by_X1Y1X2Y2(self, X1, Y1, X2, Y2):
+  def crossing_points_list(self, X1, Y1, X2, Y2, gname):
+    """Backward-compatible wrapper around :meth:`find_crossing_points`."""
+    return self.find_crossing_points(X1, Y1, X2, Y2, gname)
+
+  def find_intersections_from_curves(self, X1, Y1, X2, Y2):
+    """Return the intersections of two curves defined on increasing X grids."""
     # https://zhuanlan.zhihu.com/p/358435456
     if np.all(np.diff(X1) > 0) == True:
         pass
@@ -556,24 +522,16 @@ class InfoFile():
     X_new = X1
     Y_new = Y1 - Y2 
 
-    inersections_X = self.numpy_scipy_find_roots_by_XY(X=X_new, Y=Y_new)
+    inersections_X = self.find_roots_from_xy(X=X_new, Y=Y_new)
     inersections_Y = np.interp(inersections_X, X1, Y1)
     return inersections_X, inersections_Y
 
-  def numpy_find_commen_definitional_domain_X_by_X1X2(self, X1, X2):
-    X1.sort()
-    X2.sort()
+  def numpy_scipy_find_inersections_by_X1Y1X2Y2(self, X1, Y1, X2, Y2):
+    """Backward-compatible wrapper around :meth:`find_intersections_from_curves`."""
+    return self.find_intersections_from_curves(X1, Y1, X2, Y2)
 
-    a = np.max([X1[0], X2[0]])
-    b = np.min([X1[-1], X2[-1]])
-
-    X_full = np.append(X1, X2)
-    X_full = np.array(list(set(X_full))) 
-    X_full.sort()
-    X_commen = X_full[np.where(np.logical_and(X_full>=a, X_full<=b))]
-    return X_commen
-
-  def numpy_scipy_find_roots_by_XY(self, X, Y):
+  def find_roots_from_xy(self, X, Y):
+    """Find roots of a 1D curve by converting a linear spline into a PPoly."""
     if np.all(np.diff(X) > 0) == True:
         pass
     else:
@@ -590,8 +548,14 @@ class InfoFile():
     roots_X = roots_X_[np.where(np.logical_and(roots_X_>=X[0], roots_X_<=X[-1]))]
 
     return roots_X
+
+  def numpy_scipy_find_roots_by_XY(self, X, Y):
+    """Backward-compatible wrapper around :meth:`find_roots_from_xy`."""
+    return self.find_roots_from_xy(X, Y)
   
 if __name__ == "__main__":
-  info = InfoFile("*.gro", "*.xtc", "./info.log", 4, is_refer=False, is_gmx=True)
-  info.calc_rdf_qn()
+  raise SystemExit(
+    "This module is intended to be imported. Instantiate InfoFile with explicit "
+    "topology and trajectory paths from another script."
+  )
   

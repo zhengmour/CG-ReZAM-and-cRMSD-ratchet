@@ -87,26 +87,10 @@ def numpy_scipy_find_inersections_by_X1Y1X2Y2(X1, Y1, X2, Y2):
     Y1_new = np.interp(X_new, X1, Y1)
     Y2_new = np.interp(X_new, X2, Y2)
     Y_new = Y1_new - Y2_new
-    X_new = X1
-    Y_new = Y1 - Y2 
 
     inersections_X = numpy_scipy_find_roots_by_XY(X=X_new, Y=Y_new)
     inersections_Y = np.interp(inersections_X, X1, Y1)
     return inersections_X, inersections_Y
-
-# %%
-def numpy_find_commen_definitional_domain_X_by_X1X2(X1, X2):
-    X1.sort()
-    X2.sort()
-
-    a = np.max([X1[0], X2[0]])
-    b = np.min([X1[-1], X2[-1]])
-
-    X_full = np.append(X1, X2)
-    X_full = np.array(list(set(X_full)))  # remove duplicates
-    X_full.sort()
-    X_commen = X_full[np.where(np.logical_and(X_full >= a, X_full <= b))]
-    return X_commen
 
 # %%
 # https://stackoverflow.com/questions/11108869/optimizing-python-distance-calculation-while-accounting-for-periodic-boundary-co
@@ -117,7 +101,7 @@ def dist_PBC(x0, x1, dimensions):
 
 # %%
 # Compute angle formed by P1-B-P2
-def calc_angle(point1, bridge, point2):
+def calc_angle_3points(point1, bridge, point2):
     v1 = bridge - point1
     v1_norm = v1.dot(v1)**0.5
     v2 = bridge - point2
@@ -126,7 +110,7 @@ def calc_angle(point1, bridge, point2):
 
 # %%
 # Compute angle formed by P1-B1-B2-P2
-def calc_angle(point1, bridge1, bridge2, point2):
+def calc_angle_4points(point1, bridge1, bridge2, point2):
     v1 = bridge1 - point1
     v1_norm = v1.dot(v1)**0.5
     v2 = bridge2 - point2

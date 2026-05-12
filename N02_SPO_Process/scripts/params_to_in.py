@@ -46,9 +46,9 @@ def replace_lammps_params(input_file, output_file, params_file):
                         if unique_pair in unique_pairs_params.keys():
                             continue
                         alter_key = f"{elem2}-{elem1}"
-                        if alter_key in params.keys() and len(values) == 2:
-                            eplison = math.sqrt(values[0]*params[alter_key][0])
-                            sigma = (values[1]+params[alter_key][1]) / 2
+                        if alter_key in infos.keys() and len(values) == 2:
+                            eplison = math.sqrt(values[0] * infos[alter_key][0])
+                            sigma = (values[1] + infos[alter_key][1]) / 2
 
                             unique_pairs_params[unique_pair] = [eplison, sigma]
                         else:
@@ -90,10 +90,10 @@ def replace_lammps_params(input_file, output_file, params_file):
             if key in pairs_params.keys():
                 params_values = " ".join(map(str, pairs_params[key]))
                 rest_values = " ".join(map(str, rest[len(pairs_params[key]):]))
-                if len(pairs_params[key]) > len(rest):
-                    new_line = f"pair_coeff {type_i} {type_j} {style} {rest_values}\n"
-                else:
+                if rest_values:
                     new_line = f"pair_coeff {type_i} {type_j} {style} {params_values} {rest_values}\n"
+                else:
+                    new_line = f"pair_coeff {type_i} {type_j} {style} {params_values}\n"
                 new_lines.append(new_line)
                 continue         
         
