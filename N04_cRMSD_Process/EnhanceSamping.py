@@ -22,6 +22,7 @@ Usage examples:
                        default='lmp.in',
                        help='Enter the file path (default: lmp.in)')
 
+    parser.add_argument('--parameters', default='params.json')
     parser.add_argument('--input_md',
                        default='lmp.md.in',
                        help='Enter the file path (default: lmp.md.in)')
@@ -61,6 +62,7 @@ Usage examples:
 class EnhanceSampling:
     def __init__(self, args):
         # Read input parameters
+        self.rank = 0  # The batch driver invokes the input generator once.
         self.lmpfile = args.input
         self.lmp_mdfile = args.input_md
         self.lmp_annealingfile = args.input_annealing
@@ -83,6 +85,7 @@ class EnhanceSampling:
         with open(params_file, 'r', encoding='utf-8') as f:
             params = json.load(f)
 
+        self.simulation_type = params['Simulation_Type']
         simulation_parameters = params['Simulation_Parameters']
         self.NITERATIONS  =  simulation_parameters['niterations']
         self.INIT_ITER    =  simulation_parameters['init_iter']

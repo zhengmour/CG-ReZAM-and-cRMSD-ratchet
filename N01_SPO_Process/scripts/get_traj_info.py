@@ -253,7 +253,7 @@ class InfoFile():
         # IDEA set lower bound 1.50 to exclude OB-OB interactions; OB-OB ~1.20 in CG model
         result = rdf.InterRDF(lhg, rhg, nbins=500, range=range, exclude_same="residue")    
         # result.run(start=-500)    # only use last 500 frames
-        result.run()    # only use last 500 frames
+        result.run(start=getattr(self, "rdf_start_frame", -500))
         if outfilename:
             with open(outfilename, 'w') as of:
                 self._write_rdf_xvg(of, result.bins, result.rdf)
@@ -802,45 +802,15 @@ class InfoFile():
 
 # %%
 if __name__ == "__main__":
-    current_dir = Path(sys.argv[1])
-    nthreads = int(sys.argv[2])
-
-    info = InfoFile(current_dir/"lmp.data", current_dir/"lmp.lammpstrj", current_dir/"info.log", nthreads, is_refer=False, is_gmx=False)
-    # info = InfoFile(current_dir/"NPT.gro", current_dir/"NPT.xtc", current_dir/"info.log", nthreads, is_refer=True, is_gmx=True)
-
-    print(f"Start processing Si-related RDF")
-    Si_Si_rdf = info.get_rdf('Si', 'Si', outfilename=current_dir/"rdf_Si-Si.csv")
-    Si_Na_rdf = info.get_rdf('Si', 'Na', outfilename=current_dir/"rdf_Si-Na.csv")
-    Si_C_rdf  = info.get_rdf('Si',  'C', outfilename=current_dir/"rdf_Si-C.csv" , range=(1.5, 20.0))
-    Si_N_rdf  = info.get_rdf('Si',  'N', outfilename=current_dir/"rdf_Si-N.csv" , range=(1.5, 20.0))
-    plt.plot(Si_Si_rdf[0], Si_Si_rdf[1], label="Si-Si")
-    plt.plot(Si_Na_rdf[0], Si_Na_rdf[1], label="Si-Na")
-    plt.plot(Si_C_rdf[0], Si_C_rdf[1], label="Si-C")
-    plt.plot(Si_N_rdf[0], Si_N_rdf[1], label="Si-N")
-    plt.legend()
-    plt.savefig(current_dir / "rdf_Si.png", dpi=1200)
-    plt.cla()
-
-    print(f"Start processing Na-related RDF")
-    Na_O_rdf = info.get_rdf('Na', 'O', outfilename=current_dir/"rdf_Na-O.csv")
-    plt.plot(Na_O_rdf[0], Na_O_rdf[1], label="Na-O")
-    plt.plot(Si_Na_rdf[0], Si_Na_rdf[1], label="Si-Na")
-    plt.legend()
-    plt.savefig(current_dir / "rdf_Na.png", dpi=1200)
-    plt.cla()
-
-    print(f"Start processing C-related RDF")
-    C_O_rdf  = info.get_rdf( 'C', 'O', outfilename=current_dir/"rdf_C-O.csv" , range=(1.5, 20.0))
-    plt.plot(C_O_rdf[0], C_O_rdf[1], label="C-O")
-    plt.plot(Si_C_rdf[0], Si_C_rdf[1], label="Si-C")
-    plt.legend()
-    plt.savefig(current_dir / "rdf_C.png", dpi=1200)
-    plt.cla()
-
-    print(f"Start processing N-related RDF")
-    N_O_rdf  = info.get_rdf( 'N', 'O', outfilename=current_dir/"rdf_N-O.csv" , range=(1.5, 20.0))
-    plt.plot(N_O_rdf[0], N_O_rdf[1], label="N-O")
-    plt.plot(Si_N_rdf[0], Si_N_rdf[1], label="Si-N")
-    plt.legend()
-    plt.savefig(current_dir / "rdf_N.png", dpi=1200)
-    plt.cla()
+    import argparse
+    parser=argparse.ArgumentParser(description='Extract equilibrated CG RDFs from explicit inputs')
+    parser.add_argument('--current',required=True,type=Path)
+    parser.add_argument('--workers',type=int,default=1)
+    parser.add_argument('--start-frame',type=int,default=-500)
+    parser.add_argument('--r-min',type=float,default=1.5)
+    parser.add_argument('--r-max',type=float,default=12.)
+    args=parser.parse_args();current_dir=args.current.resolve()
+    info=InfoFile(current_dir/'lmp.data',current_dir/'lmp.lammpstrj',current_dir/'info.log',args.workers,is_refer=False,is_gmx=False)
+    info.rdf_start_frame=args.start_frame
+    for left,right in [('Si','Si'),('Si','Na'),('Si','C'),('Si','N'),('Na','O'),('C','O'),('N','O')]:
+        info.get_rdf(left,right,range=(args.r_min,args.r_max),outfilename=current_dir/('rdf_'+left+'-'+right+'.csv'))

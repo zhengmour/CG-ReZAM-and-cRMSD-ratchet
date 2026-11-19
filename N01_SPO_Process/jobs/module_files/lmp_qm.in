@@ -98,11 +98,10 @@ angle_coeff     2       4.9474 109.47
 bond_coeff      5       0.0 1.050
 
 # shake for SIV
-fix 	rigid SIV shake 0.0001 20 1000 b 2  
+# Single-point QM comparison: evaluate the specified geometry without SHAKE forces.
+# fix rigid SIV shake 0.0001 20 1000 b 2
 
-fix	    mynvt_SIV SIV nvt temp 453.0 453.0 25.0 
-fix     mynvt_other other nvt temp 453.0 453.0 25.0 
-fix 		move all momentum 1 linear 1 1 1
+# Static energy/force evaluation: no thermostat or momentum/constraint forces.
 
 thermo_style custom step temp press ke pe epair 
 timestep  1.00
@@ -110,5 +109,7 @@ thermo    1000
 
 dump mydump all custom 1 ${name}.lammpstrj id type x y z fx fy fz
 dump_modify mydump sort id
+dump_modify mydump format float %.16g
+thermo_modify format float %.16g
 run 0 post no
 

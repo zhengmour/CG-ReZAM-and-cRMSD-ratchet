@@ -1,4 +1,4 @@
-#!/home/zhengda/anaconda3/envs/mda/bin/python
+#!/usr/bin/env python3
 import sys, os
 import MDAnalysis as mda
 from MDAnalysis.core.groups import AtomGroup
@@ -329,7 +329,7 @@ class InfoFile():
 
     Tsos_all = []
     with open(self.fqn, 'w') as of, open(self.log, 'a') as logf:          
-      print("# Andre Carvalho\n# MolModel Group\n# Universidade de Aveiro\n# andre.dc@ua.pt", file=of)                                                          
+      print("# <author>\n# <group>\n# <institution>\n# <email>", file=of)
       print('@    title "Silica condensation"\n@    xaxis  label "time"\n@    yaxis  label "qi"\n@TYPE xy\n@ view 0.15, 0.15, 0.75, 0.85\n@ legend on\n@ legend box on\n@ legend loctype view\n@ legend 0.78, 0.8\n@ legend length 2\n@ s0 legend "Q0"\n@ s1 legend "Q1"\n@ s2 legend "Q2"\n@ s3 legend "Q3"\n@ s4 legend "Q4"\n@ s5 legend "Qn"\n@ s6 legend "C"\n@ s0 line color "black"\n@ s1 line color "red"\n@ s2 line color "blue"\n@ s3 line color "magenta"\n@ s4 line color "brown"\n@ s5 line color "yellow"\n@ s6 line color "green"\n', file=of)
       
       logf.write("# calc_qn starting...\n")

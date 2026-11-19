@@ -1,0 +1,17 @@
+#include "gene.itp"
+#include "system.itp"
+#include "stella8VS.itp"
+#include "tpa_cg.itp"
+#include "na_cg.itp"
+#include "br_cg.itp"
+#include "w_cg.itp"
+
+[ system ]
+Silicate gel precursor
+
+[ molecules ]
+SIV   2480
+TPA    248
+NA     248
+BR     496
+W    49600

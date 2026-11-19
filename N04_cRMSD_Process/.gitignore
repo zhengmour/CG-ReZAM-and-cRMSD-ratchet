@@ -1,0 +1,5 @@
+__pycache__/
+build/
+tests/
+validation/
+C_PIRMSD.cpython-*.so

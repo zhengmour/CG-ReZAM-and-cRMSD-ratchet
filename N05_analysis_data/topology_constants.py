@@ -36,7 +36,10 @@ CHAIN_LIST = ['linear', 'branch', 'cyclic']
 
 # --- Atom types ---
 Si_type = 1
-O_type  = [2, 3, 4]
+O_type  = [2]  # SP; type 3 is a virtual site
+
+# Explicit default: distance criterion without an undocumented hysteresis width.
+HYSTERESIS_MARGIN = 0.0
 
 # --- Plot style  ---
 PLOT_COLORS_6 = [

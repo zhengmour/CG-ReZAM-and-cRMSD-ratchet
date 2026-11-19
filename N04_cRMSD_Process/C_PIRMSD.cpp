@@ -11,19 +11,23 @@
 #include <thread>
 #include <mutex>
 #include <mpi.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <array>
+#include <limits>
+#include <stdexcept>
 namespace py = pybind11;
 
 #define XI 2 
 #define YI 3 
 #define ZI 4 
 
-std::mutex mtx; // Protect counter
 
 #define Stype 1
 // All std::vector<double> store information as: id, type, x, y, z
 
 // Constant used in Merge sort
-const std::vector<double> Max = {-1.0, 100000.0, 100000.0, 100000.0};
+
 
 // Sigmoid function in [0, 1] range
 inline double sigmoid(double inx) {
@@ -137,50 +141,17 @@ inline bool distance_pbc(const std::vector<double> &a,
     return r1_sq < r2_sq;
 }
 
-// Merge sort merge step
-void Merge(std::vector<std::vector<double>> &Array, 
-           const std::vector<double> &c, int front, int mid, int end) {
-    
-    std::vector<std::vector<double>> LeftSub(
-        Array.begin() + front, Array.begin() + mid + 1);
-    std::vector<std::vector<double>> RightSub(
-        Array.begin() + mid + 1, Array.begin() + end + 1);
-
-    LeftSub.push_back(Max);
-    RightSub.push_back(Max);
-
-    int idxLeft = 0, idxRight = 0;
-
-    for (int i = front; i <= end; ++i) {
-        if (distance_pbc(LeftSub[idxLeft], RightSub[idxRight], c)) {
-            Array[i] = std::move(LeftSub[idxLeft]);
-            ++idxLeft;
-        } else {
-            Array[i] = std::move(RightSub[idxRight]);
-            ++idxRight;
-        }
-    }
-}
-void MergeSort(std::vector<std::vector<double>> &array, 
-               const std::vector<double> &c, int front, int end) {
-    if (front < end) {
-        const int mid = front + (end - front) / 2;  // Prevent overflow
-        MergeSort(array, c, front, mid);
-        MergeSort(array, c, mid + 1, end);
-        Merge(array, c, front, mid, end);
-    }
-}
-
-// Sort reference structure by distance to geometric center
-std::vector<std::vector<double>> _Sort2center(const std::vector<std::vector<double>> &BASE_STRUCTURE) {
-	auto bs = BASE_STRUCTURE;
-
-    // Compute geometric center
-    std::vector<double> center = _get_center(BASE_STRUCTURE);
-
-    // Sort
-    MergeSort(bs, center, 0, bs.size() - 1);
-    return bs;
+// Stable sorting avoids the old four-column sentinel being read as five columns.
+std::vector<std::vector<double>> _Sort2center(const std::vector<std::vector<double>> &base) {
+    if (base.empty()) throw std::invalid_argument("Empty reference structure");
+    for (const auto &row : base)
+        if (row.size() != 5) throw std::invalid_argument("Expected [id,type,x,y,z]");
+    auto sorted = base;
+    const auto center = _get_center(base);
+    std::stable_sort(sorted.begin(), sorted.end(), [&](const auto &a, const auto &b) {
+        return distance_pbc(a, b, center);
+    });
+    return sorted;
 }
 
 double _sigmoidal_logistic(const double &r, const double &critical_radius, const double &alpha) {
@@ -194,116 +165,83 @@ std::pair<double, std::vector<std::vector<double>>> _min_R2(
     double critical_radius, 
     double alpha) {
 
-    // Group atoms by type
-    std::unordered_map<int, std::vector<int>> atoms_by_type;
-    for (int i = 0; i < SOLVE_ATOM.size(); ++i) {
-        int atom_type = static_cast<int>(SOLVE_ATOM[i][1]);
-        atoms_by_type[atom_type].push_back(i);
-    }
-
-	// Output parameters
-	double RMSD = 0;
-	std::vector<std::vector<double>> MOVE_ATOM;
-	std::unordered_set<int> selected_atom;  // Use unordered_set to speed up lookup
-
-    const auto& base = BASE_STRUCTURE;
-    const auto& atoms = SOLVE_ATOM;
-    const std::vector<double> center = _get_center(BASE_STRUCTURE);
-
-    double weight = 1.0;
-    double delta_x, delta_y, delta_z, d2, delta_x_c, delta_y_c, delta_z_c, r, safe_r, exp_term;  
-    double dw_dr, dr_dx, dr_dy, dr_dz, dw_dx, dw_dy, dw_dz, grad_dx, grad_dy, grad_dz;
-    double sum_weight = 0.0;
-
-	MOVE_ATOM.reserve(base.size());
-
-	for (auto &refer : base) {
-        if (selected_atom.size() >= atoms.size()) break;
-
-		double dmin2 = INFINITY;
-		std::vector<double> choose_atom; // id, type, dSx, dSy, dSz, dWx, dWy, dWz, weight
-
-		const int refer_type = static_cast<int>(refer[1]);
-        if (atoms_by_type.find(refer_type) != atoms_by_type.end()) {
-            for (int atom_idx : atoms_by_type[refer_type]) {
-                // Check whether we have already used all available atoms
-                if (selected_atom.size() >= atoms.size()) break;
-
-                const auto &atom = atoms[atom_idx];
-                const int atom_type = static_cast<int>(atom[1]);
-                if (selected_atom.count(static_cast<int>(atom[0]))) continue;  // Skip already selected atoms
-                
-                // // Fast distance estimate (Manhattan distance pre-filter)
-                // dx_abs = std::abs(refer_x - atom[XI]);
-                // dy_abs = std::abs(refer_y - atom[YI]);
-                // dz_abs = std::abs(refer_z - atom[ZI]);
-                //
-                // if (dx_abs + dy_abs + dz_abs > max_search_distance * 1.73) continue; // Rough pre-filter
-
-                delta_x = atom[XI] - refer[XI];
-                delta_y = atom[YI] - refer[YI];
-                delta_z = atom[ZI] - refer[ZI];
-                d2 = delta_x*delta_x + delta_y*delta_y + delta_z*delta_z;
-                
-                if (d2 < dmin2) {	
-                    dmin2 = d2;     
-                    choose_atom.clear();		
-                    choose_atom.resize(9);	
-                    weight = 1.0; dw_dx = 0.0; dw_dy = 0.0; dw_dz = 0.0;
-                    
-                    if (critical_radius < 1.0E6) {                        
-                        delta_x_c = atom[XI] - center[0];		
-                        delta_y_c = atom[YI] - center[1];		
-                        delta_z_c = atom[ZI] - center[2];	
-                        r = sqrt(delta_x_c*delta_x_c + delta_y_c*delta_y_c + delta_z_c*delta_z_c);
-                        
-                        safe_r = (r < 1e-8) ? 1e-8 : r;
-                        exp_term = std::exp(alpha * (r - critical_radius));
-                        weight = 1.0 / (1.0 + exp_term);
-                        dw_dr = -alpha * weight * (1.0 - weight);
-
-                        // 4. Compute derivative of distance
-                        dr_dx = delta_x_c / safe_r;
-                        dr_dy = delta_y_c / safe_r;
-                        dr_dz = delta_z_c / safe_r;
-                        
-                        // 5. Compute derivative of weight with respect to coordinates
-                        dw_dx = dw_dr * dr_dx;
-                        dw_dy = dw_dr * dr_dy;
-                        dw_dz = dw_dr * dr_dz;
-                    } else {
-                        weight = 1.0; dw_dx = 0.0; dw_dy = 0.0; dw_dz = 0.0;
-                    }
-
-                    // dS/dx_j = 2*w*dx + d^2 * (dw/dx_j)
-                    grad_dx = 2.0 * weight * delta_x + d2 * dw_dx;
-                    grad_dy = 2.0 * weight * delta_y + d2 * dw_dy;
-                    grad_dz = 2.0 * weight * delta_z + d2 * dw_dz;
-
-                    choose_atom[0] = atom[0];
-                    choose_atom[1] = atom_type;
-                    choose_atom[2] = grad_dx;
-                    choose_atom[3] = grad_dy;
-                    choose_atom[4] = grad_dz;
-                    choose_atom[5] = dw_dx;
-                    choose_atom[6] = dw_dy;
-                    choose_atom[7] = dw_dz;
-                    choose_atom[8] = weight;
-            
-                }    	
-            }
-            if (!choose_atom.empty()) { 
-                selected_atom.insert(static_cast<int>(choose_atom[0]));
-                sum_weight += choose_atom[8];
-                RMSD += weight * dmin2;
-                MOVE_ATOM.push_back(std::move(choose_atom));    
-            }
+    if (BASE_STRUCTURE.empty() || SOLVE_ATOM.empty())
+        throw std::invalid_argument("PIRMSD requires nonempty structures");
+    std::unordered_map<int, std::vector<int>> by_type;
+    for (int i=0; i<static_cast<int>(SOLVE_ATOM.size()); ++i)
+        by_type[static_cast<int>(SOLVE_ATOM[i][1])].push_back(i);
+    const auto center = _get_center(BASE_STRUCTURE);
+    std::vector<unsigned char> used(SOLVE_ATOM.size(), 0);
+    std::vector<std::vector<double>> moves;
+    moves.reserve(std::min(BASE_STRUCTURE.size(), SOLVE_ATOM.size()));
+    double sum=0., weights=0.;
+    for (const auto &ref : BASE_STRUCTURE) {
+        int best=-1;
+        double d2=std::numeric_limits<double>::infinity();
+        for (int j : by_type[static_cast<int>(ref[1])]) {
+            if (used[j]) continue;
+            const auto &atom=SOLVE_ATOM[j];
+            double dx=atom[2]-ref[2], dy=atom[3]-ref[3], dz=atom[4]-ref[4];
+            double candidate=dx*dx+dy*dy+dz*dz;
+            if (candidate<d2) { d2=candidate; best=j; }
         }
+        if (best<0) continue;
+        used[best]=1;
+        const auto &atom=SOLVE_ATOM[best];
+        double r2=0.;
+        for (int k=0;k<3;++k) r2+=std::pow(atom[k+2]-center[k],2);
+        const double r=std::sqrt(r2);
+        // Calculate expensive weights/derivatives once, after selecting a match.
+        double w=critical_radius<1.e6 ? sigmoid(-alpha*(r-critical_radius)) : 1.;
+        std::vector<double> row(9,0.);
+        row[0]=atom[0]; row[1]=atom[1]; row[8]=w;
+        for (int k=0;k<3;++k) {
+            double dw=-alpha*w*(1.-w)*(atom[k+2]-center[k])/std::max(r,1.e-8);
+            row[k+5]=dw;
+            row[k+2]=2.*w*(atom[k+2]-ref[k+2])+d2*dw;
+        }
+        sum+=w*d2; weights+=w; moves.push_back(std::move(row));
     }
+    if (moves.empty() || weights<=1.e-30)
+        throw std::invalid_argument("No matching atoms with nonzero PIRMSD weight");
+    return std::make_pair(std::sqrt(sum/weights), moves);
+}
 
-    const double eps = 1e-30;
-    RMSD = sqrt(RMSD / std::max(sum_weight, eps));
-    return make_pair(RMSD, MOVE_ATOM);
+// Fixed reference slots: every vacancy has unit cost. Matched residuals use
+// a C2 bounded loss.
+std::pair<double, std::vector<std::vector<double>>> _boundary_R2(
+    const std::vector<std::vector<double>> &base,
+    const std::vector<std::vector<double>> &atoms, double cutoff) {
+    if (base.empty() || !std::isfinite(cutoff) || cutoff<=0.)
+        throw std::invalid_argument("Boundary PIRMSD needs reference slots and a positive cutoff");
+    std::unordered_map<int, std::vector<int>> by_type;
+    for (int i=0;i<static_cast<int>(atoms.size());++i)
+        by_type[static_cast<int>(atoms[i][1])].push_back(i);
+    std::vector<unsigned char> used(atoms.size(),0);
+    std::vector<std::vector<double>> moves;
+    // Accumulate loss directly so near-perfect matches do not lose precision.
+    double sum=0.;
+    for (const auto &ref : base) {
+        int best=-1;
+        double d2=std::numeric_limits<double>::infinity();
+        for (int j : by_type[static_cast<int>(ref[1])]) {
+            if (used[j]) continue;
+            double candidate=0.;
+            for (int k=2;k<5;++k) candidate+=std::pow(atoms[j][k]-ref[k],2);
+            if (candidate<d2) { best=j; d2=candidate; }
+        }
+        if (best<0 || d2>=cutoff*cutoff) { sum+=1.; continue; }
+        used[best]=1;
+        double u=d2/(cutoff*cutoff), z=std::max(0.,1.-u);
+        double loss=u<1. ? u*(3.-3.*u+u*u) : 1.;
+        sum+=loss;
+        std::vector<double> row(10,0.);
+        row[0]=atoms[best][0]; row[1]=atoms[best][1]; row[8]=1.; row[9]=ref[0];
+        for (int k=0;k<3;++k)
+            row[k+2]=6.*z*z*(atoms[best][k+2]-ref[k+2])/(cutoff*cutoff);
+        moves.push_back(std::move(row));
+    }
+    return std::make_pair(std::sqrt(sum/base.size()),moves);
 }
 
 // MPI version of BFGS optimization function
@@ -317,16 +255,18 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
 	bool fixed_move,
     double critical_radius,
     double alpha,
-    int f_comm) {
+    int f_comm, double boundary_cutoff=0.) {
 
-	// Generate different random seeds
-	std::random_device rd;  // If available, get a true random seed from the random device
-	std::mt19937 gen(rd()); // Standard Mersenne Twister engine seeded with rd()
-	std::uniform_real_distribution<double> distrib(0, 1);
+	if (OUTER < 1 || INTER < 1 || MOVE.size()!=6 || Epsilon<=0)
+        throw std::invalid_argument("Invalid PIRMSD optimizer settings");
 
 	auto bs = BASE_STRUCTURE;
 	auto sa = SOLVE_ATOM;
 	auto mv = MOVE;
+    auto evaluate = [&](const std::vector<std::vector<double>> &reference) {
+        return boundary_cutoff>0. ? _boundary_R2(reference, sa, boundary_cutoff)
+                                  : _min_R2(reference, sa, critical_radius, alpha);
+    };
 
 	std::array<double, 6> move0 = {mv[0], mv[1], mv[2], mv[3], mv[4], mv[5]};
 
@@ -341,7 +281,7 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
     // Whether to perform optimization iterations
 	if (fixed_move) {
         auto temp_bs = _move(bs, move0.data());
-        auto D_P = _min_R2(temp_bs, sa, critical_radius, alpha);
+        auto D_P = evaluate(temp_bs);
         return std::make_tuple(D_P.first, D_P.second, mv);
 	}
 
@@ -351,26 +291,16 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
     const int end_idx = std::min(start_idx + local_outer, OUTER);
     const int actual_local_outer = std::max(0, end_idx - start_idx);
 
-    // Local result storage
-    std::vector<double> local_RMSD_list;
-    std::vector<std::vector<std::vector<double>>> local_MOVE_ATOM_list;
-    std::vector<std::array<double, 6>> local_MOVE_list;
+    // Retain one candidate per rank, including the incoming warm start.
+    auto initial = evaluate(_move(bs, move0.data()));
+    double local_best = initial.first;
+    std::array<double,6> local_move = move0;
 
     if (actual_local_outer > 0) {
-        local_RMSD_list.resize(actual_local_outer * INTER, 10000.0);
-        local_MOVE_ATOM_list.resize(actual_local_outer * INTER);
-        local_MOVE_list.resize(actual_local_outer * INTER);
-
-        // Initialize xk, fk, bs
-        auto temp_bs = _move(bs, move0.data());
-        std::array<double, 6> x0 = {0, 0, 0, 0, 0, 0};
-        double f0 = _min_R2(temp_bs, sa, critical_radius, alpha).first;
-
         Eigen::Matrix<double, 6, 6> I = Eigen::Matrix<double, 6, 6>::Identity();
 
         // Random number generator
-        std::random_device rd;
-        std::mt19937 gen(rd() + rank);  // Different seed for each process
+        std::mt19937 gen(1729 + rank);  // Different seed for each process
         std::uniform_real_distribution<double> distrib(0.0, 1.0);
 
         // Local outer-loop iterations
@@ -384,62 +314,49 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
                                         (distrib(gen) - 0.5) * 3.14159, 
                                         (distrib(gen) - 0.5) * 3.14159};
             std::array<double, 6> xk_1;
-            std::array<double, 6> lambda = {0.0, 0.0, 0.0, 
-                                            distrib(gen) * 0.1, 
-                                            distrib(gen) * 0.1, 
-                                            distrib(gen) * 0.1};
-
-            std::vector<std::vector<double>> MOVE_ATOM;
-
             Eigen::Matrix<double, 6, 1> dk, sk, yk, gk_1, gk;
             Eigen::Matrix<double, 6, 6> Dk = I, Dk_1;
 
-            // Initialize gradient
-            for (int i = 0; i < 6; ++i) {
-                const double diff = xk[i] - x0[i];
-                if (std::abs(diff) > 1e-10) {
-                    const double grad = (fk - f0) / diff;
-                    gk(i, 0) = std::clamp(grad, -10.0, 10.0);  // Clamp gradient range
-                } else {
-                    gk(i, 0) = Epsilon;
+            auto objective = [&](std::array<double,6> x) {
+                return evaluate(_move(bs, x.data())).first;
+            };
+            auto gradient = [&](const std::array<double,6> &x) {
+                Eigen::Matrix<double,6,1> g = Eigen::Matrix<double,6,1>::Zero();
+                for (int j=3;j<6;++j) {
+                    auto plus=x, minus=x;
+                    plus[j]+=1.e-5; minus[j]-=1.e-5;
+                    g[j]=(objective(plus)-objective(minus))/2.e-5;
                 }
-            }
+                return g;
+            };
+            // Rotation only: translation is handled by Python centering.
+            if (start_idx+local_outer_idx==0) xk=move0;
+            fk=objective(xk);
+            if (fk<local_best) { local_best=fk; local_move=xk; }
+            gk=gradient(xk);
 
             // Inner iterations
             for (int inter = 0; inter < INTER; ++inter) {
                 dk = -Dk * gk;
 
-                // Use sigmoid function to limit the step size
-                for (int i = 0; i < 6; ++i) {
-                    dk(i, 0) = 2.0 * (sigmoid(dk(i, 0)) - 0.5);
-                    sk(i, 0) = lambda[i] * dk(i, 0);
-                    xk_1[i] = xk[i] + sk(i, 0);
+                if (dk.dot(gk)>=0.) { Dk=I; dk=-gk; }
+                double step=std::min(1., 0.25/std::max(dk.norm(),1.e-30));
+                bool improved=false;
+                for (int trial=0;trial<12;++trial) {
+                    for (int j=0;j<6;++j) xk_1[j]=xk[j]+step*dk[j];
+                    fk_1=objective(xk_1);
+                    if (fk_1<=fk+1.e-4*step*gk.dot(dk)) { improved=true; break; }
+                    step*=0.5;
                 }
-
-                auto temp_bs = _move(bs, xk_1.data());
-                auto D_P = _min_R2(temp_bs, sa, critical_radius, alpha);
-                RMSD = D_P.first;
-                fk_1 = D_P.first;
-                MOVE_ATOM = D_P.second;
-
-                // Compute new gradient
-                for (int i = 0; i < 6; ++i) {
-                    const double diff = xk_1[i] - xk[i];
-                    if (std::abs(diff) > 1e-10) {
-                        const double grad = (fk_1 - fk) / diff;
-                        gk_1(i, 0) = std::clamp(grad, -10.0, 10.0);
-                    } else {
-                        gk_1(i, 0) = Epsilon;
-                    }
-                    yk(i, 0) = gk_1(i, 0) - gk(i, 0);
-                }
+                if (!improved) break;
+                for (int j=0;j<6;++j) sk[j]=xk_1[j]-xk[j];
+                RMSD=fk_1;
+                gk_1=gradient(xk_1);
+                yk=gk_1-gk;
 
                 // Convergence check
                 double Ngk_1 = gk_1.norm();
-                const int result_idx = local_outer_idx * INTER + inter;
-                local_RMSD_list[result_idx] = RMSD;
-                local_MOVE_ATOM_list[result_idx] = MOVE_ATOM;
-                local_MOVE_list[result_idx] = xk_1;
+                if (RMSD < local_best) { local_best = RMSD; local_move = xk_1; }
 
                 if (Ngk_1 <= Epsilon) {
                     break;
@@ -447,11 +364,8 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
 
                 // Update Hessian approximation
                 double L = yk.transpose() * sk;
-                if (std::abs(L) < Epsilon) {
-                    // Reset Hessian approximation
-                    for (int i = 0; i < 6; i++) 
-						for (int j = 0; j < 6; j++) 
-								Dk_1(i, j) = (sigmoid(Dk(i, j)) - 0.5) / Epsilon;
+                if (L <= 1.e-12) {
+                    Dk_1 = I;
                 } else {
                     const auto I_minus_sk_yk = I - (sk * yk.transpose()) / L;
                     const auto I_minus_yk_sk = I - (yk * sk.transpose()) / L;
@@ -468,85 +382,12 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
         }
     }
 
-	// MPI collect results
-    std::vector<int> recvcounts(size);
-    std::vector<int> displs(size);
-    
-    int local_count = local_RMSD_list.size();
-    MPI_Allgather(&local_count, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, comm);
-    
-    int total_count = 0;
-    for (int i = 0; i < size; ++i) {
-        displs[i] = total_count;
-        total_count += recvcounts[i];
-    }
-
-	std::vector<double> global_RMSD_list(total_count);
-    MPI_Allgatherv(local_RMSD_list.data(), local_count, MPI_DOUBLE,
-                   global_RMSD_list.data(), recvcounts.data(), displs.data(), 
-                   MPI_DOUBLE, comm);
-
-    // Find the best (minimum) solution
-    auto smallest = std::min_element(global_RMSD_list.begin(), global_RMSD_list.end());
-    int global_minID = std::distance(global_RMSD_list.begin(), smallest);
-    
-    // Determine which rank owns the best solution
-    int owner_rank = 0;
-    int local_minID = 0;
-    int cumulative = 0;
-    for (int i = 0; i < size; ++i) {
-        if (global_minID < cumulative + recvcounts[i]) {
-            owner_rank = i;
-            local_minID = global_minID - cumulative;
-            break;
-        }
-        cumulative += recvcounts[i];
-    }
-
-    double best_RMSD = global_RMSD_list[global_minID];
-    std::vector<std::vector<double>> best_MOVE_ATOM;
-    std::array<double, 6> best_move;
-
-	// Broadcast best result from the owner rank
-    if (rank == owner_rank && local_minID < local_MOVE_ATOM_list.size()) {
-        best_MOVE_ATOM = local_MOVE_ATOM_list[local_minID];
-        best_move = local_MOVE_list[local_minID];
-    }
-
-    // Broadcast size information of best_MOVE_ATOM
-    int move_atom_size = (rank == owner_rank) ? best_MOVE_ATOM.size() : 0;
-    MPI_Bcast(&move_atom_size, 1, MPI_INT, owner_rank, comm);
-    
-    if (rank != owner_rank) {
-        best_MOVE_ATOM.resize(move_atom_size);
-    }
-
-    MPI_Bcast(best_move.data(), 6, MPI_DOUBLE, owner_rank, comm);
-
-    // For non-owner ranks, recompute best_MOVE_ATOM locally
-    if (rank != owner_rank) {
-        // Recompute best solution
-        auto temp_bs = _move(BASE_STRUCTURE, best_move.data());
-        auto temp_result = _min_R2(temp_bs, sa, critical_radius, alpha);
-        best_MOVE_ATOM = temp_result.second;
-
-        // Check whether temp_result.first and best_RMSD are consistent
-        double local_rmsd = temp_result.first;
-        double diff = std::abs(local_rmsd - best_RMSD);
-
-        if (diff > 1e-4) {  // Or set threshold based on precision requirement
-            std::cerr << "[Rank " << rank << "] Warning: Recomputed RMSD (" << local_rmsd 
-                    << ") differs from best_RMSD (" << best_RMSD 
-                    << ") by " << diff << std::endl;
-        }
-    }
-
-    // Update output parameter MOVE
-    for (int i = 0; i < 6; ++i) {
-        mv[i] = best_move[i];
-    }
-
-    return std::make_tuple(best_RMSD, best_MOVE_ATOM, mv);
+    struct { double value; int rank; } local{local_best, rank}, global;
+    MPI_Allreduce(&local, &global, 1, MPI_DOUBLE_INT, MPI_MINLOC, comm);
+    MPI_Bcast(local_move.data(), 6, MPI_DOUBLE, global.rank, comm);
+    auto result = evaluate(_move(bs, local_move.data()));
+    return std::make_tuple(result.first, result.second,
+                           std::vector<double>(local_move.begin(), local_move.end()));
 }
 
 std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_NORMAL(
@@ -564,9 +405,22 @@ std::tuple<double, std::vector<std::vector<double>>, std::vector<double>> _BFGS_
 
 PYBIND11_MODULE(C_PIRMSD, m)
 {
+	m.attr("API_VERSION") = 3;
 	m.doc() = "C_PIRMSD"; // optional module docstring
 	m.def("_min_R2", &_min_R2, "A function that computing min_RMSD");
 	m.def("_Sort2center", &_Sort2center, "A function that computing min_RMSD");
 	m.def("_BFGS_NORMAL", &_BFGS_NORMAL, "A function that computing min_RMSD");
-	m.def("_BFGS_CENTER", &_BFGS_CENTER, "A function that computing min_RMSD");
+	m.def("_BFGS_CENTER", [](const std::vector<std::vector<double>> &base,
+        const std::vector<std::vector<double>> &atoms, int outer, int inner,
+        double epsilon, std::vector<double> move, bool fixed, double radius,
+        double alpha, int comm) {
+        return _BFGS_CENTER(base,atoms,outer,inner,epsilon,move,fixed,radius,alpha,comm);
+    });
+    m.def("_boundary_R2", &_boundary_R2);
+    m.def("_BFGS_BOUNDARY", [](const std::vector<std::vector<double>> &base,
+        const std::vector<std::vector<double>> &atoms, int outer, int inner,
+        double epsilon, std::vector<double> move, bool fixed, double cutoff, int comm) {
+        if (!std::isfinite(cutoff) || cutoff<=0.) throw std::invalid_argument("Invalid cutoff");
+        return _BFGS_CENTER(base,atoms,outer,inner,epsilon,move,fixed,1.e7,0.,comm,cutoff);
+    });
 }

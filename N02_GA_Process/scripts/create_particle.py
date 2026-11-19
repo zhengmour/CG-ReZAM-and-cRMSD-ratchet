@@ -14,7 +14,7 @@ D_Q_a = D_Q / 3 * math.sqrt(6)
 D_VS_a = D_VS / 3 * math.sqrt(6)
 factor = 1/math.sqrt(2)
 
-with open('RSi.mol', 'w') as wf:
+with open(os.path.join(DIR, 'RSi.mol'), 'w') as wf:
     wf.write("""
 # Water molecule. Explicit TIP4P geometry for use with fix rigid
 

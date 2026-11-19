@@ -54,152 +54,70 @@ def tile_ob_positions(ob_positions, cell):
     return np.vstack(tiled), np.array(orig_idx, dtype=int)
 
 
-def build_graphs_direct(
-    Si_pos,
-    OB_pos,
-    cell_vec,
-    si_si_cutoff=SiSi_distance,
-    ob_cutoff=OBOB_distance,
-    siob_cutoff=SiOB_distance,
-):
-    """
-    Build graph by pure distance + OB filtering (no hysteresis):
-    - dist(Si-Si) < si_si_cutoff as candidate edges
-    - With OB filtering: each of Si_i & Si_j must have nearby OB,
-      and there must exist an OB-OB pair with distance < ob_cutoff.
-    """
-    Si_pos = np.asarray(Si_pos)
-    N = len(Si_pos)
-
-    # Si-Si MIC distance matrix
-    dist = pairwise_mic_distances(Si_pos, cell_vec)
-
-    # Candidate Si-Si bonds (upper triangle)
-    candidate_mask = (dist < si_si_cutoff)
-    idxs = np.transpose(np.nonzero(candidate_mask))
-
-    bonds = set()
-
-    # If OB filtering is disabled, directly add bonds
-    if (ob_cutoff is None) or (OB_pos is None) or (len(OB_pos) == 0):
-        for i, j in idxs:
-            if i >= j:
-                continue
-            bonds.add(frozenset((i, j)))
-        return bonds
-
-    # Otherwise: pre-tile OB and build KDTree
-    tiled_ob, tiled_idx = tile_ob_positions(OB_pos, cell_vec)
-    if len(tiled_ob) == 0:
-        # No OB available, return empty set
-        return bonds
-
-    ob_tree = cKDTree(tiled_ob)
-
-    for i, j in idxs:
-        if i >= j:
-            continue
-
-        si_i_pos = Si_pos[i]
-        si_j_pos = Si_pos[j]
-
-        ob_neighbors_i = ob_tree.query_ball_point(si_i_pos, siob_cutoff)
-        ob_neighbors_j = ob_tree.query_ball_point(si_j_pos, siob_cutoff)
-
-        if len(ob_neighbors_i) == 0 or len(ob_neighbors_j) == 0:
-            continue
-
-        connected = False
-        for ti in ob_neighbors_i:
-            for tj in ob_neighbors_j:
-                if np.linalg.norm(tiled_ob[ti] - tiled_ob[tj]) < ob_cutoff:
-                    connected = True
-                    break
-            if connected:
-                break
-
-        if not connected:
-            continue
-
-        bonds.add(frozenset((i, j)))
-
-    return bonds
+def _wrapped(points, cell):
+    # Modulo can round a tiny negative coordinate to exactly the box length.
+    return np.remainder(np.remainder(points, cell), cell)
 
 
-def build_graphs_hysteresis(Si_pos, OB_pos, cell_vec, prev_bonds, sisi_cutoff=SiSi_distance, ob_cutoff=OBOB_distance, siob_cutoff=SiOB_distance, create_margin=HYSTERESIS_MARGIN):
-    """
-    Sequential single-thread build: apply hysteresis to generate NetworkX Graph bonds for all frames.
-    topologies: list of ( (Si_positions, OB_positions), cell, time )
-    sisi_cutoff: nominal Si-Si neighbor distance (for create/break)
-    create_margin: hysteresis margin (Å)
-    ob_cutoff: OBOB_distance (for Si-OB-OB chemical filtering); if None, skip OB filtering
-    siob_cutoff: Si-OB distance for neighborhood (if None, caller uses SiOB_distance from constants)
-    Returns a set of bonds for the current frame.
-    """
-    create_cutoff = sisi_cutoff - create_margin   # Tighter criterion for creating bonds
-    break_cutoff  = sisi_cutoff + create_margin   # Looser criterion for breaking bonds
+def _mic_lengths(delta, cell):
+    fractional = delta / cell
+    return np.linalg.norm((fractional - np.rint(fractional)) * cell, axis=-1)
 
-    Si_pos = np.asarray(Si_pos)
-    N = len(Si_pos)
 
-    # Si-Si MIC distance matrix
-    dist = pairwise_mic_distances(Si_pos, cell_vec)
+def _nearby_pairs(positions, cell, cutoff):
+    if cutoff <= 0 or len(positions) < 2:
+        return np.empty((0, 2), dtype=int)
+    tree = cKDTree(_wrapped(positions, cell), boxsize=cell)
+    # Apply the original strict cutoff to candidates from the periodic tree.
+    slack = 8 * np.finfo(float).eps * max(cell)
+    pairs = tree.query_pairs(cutoff + slack, output_type='ndarray')
+    delta = positions[pairs[:, 0]] - positions[pairs[:, 1]]
+    return pairs[_mic_lengths(delta, cell) < cutoff]
 
-    # Create / Break masks
-    create_mask = (dist < create_cutoff)
-    break_mask = (dist > break_cutoff)
 
-    # OB precompute: tiled positions + KDTree (if needed)
-    tiled_ob = None; tiled_idx = None; ob_tree = None
-    if (ob_cutoff is not None) and (OB_pos is not None) and len(OB_pos) > 0:
-        tiled_ob, tiled_idx = tile_ob_positions(OB_pos, cell_vec)
-        ob_tree = cKDTree(tiled_ob)
+def _create_bonds(si, ob, cell, cutoff, siob_cutoff, ob_cutoff, retained):
+    pairs = _nearby_pairs(si, cell, cutoff)
+    new_pairs = [(i, j) for i, j in pairs if frozenset((i, j)) not in retained]
+    if not new_pairs:
+        return retained
+    if ob_cutoff is None or ob is None or len(ob) == 0:
+        retained.update(frozenset(pair) for pair in new_pairs)
+        return retained
 
-    # Start from prev_bonds and apply break rule
-    bonds = set()
-    for b in prev_bonds:
-        i, j = tuple(b)
-        if break_mask[i, j]:
-            # Break bond
-            continue
-        bonds.add(b)
+    ob = np.asarray(ob)
+    tree = cKDTree(_wrapped(ob, cell), boxsize=cell)
+    involved = np.unique(new_pairs)
+    neighbors = dict(zip(involved, tree.query_ball_point(_wrapped(si[involved], cell), siob_cutoff)))
+    for i, j in new_pairs:
+        left, right = neighbors[i], neighbors[j]
+        if left and right:
+            a = np.asarray(left)[:, None]
+            b = np.asarray(right)
+            delta = ob[a] - ob[b]
+            distances = np.linalg.norm(delta - cell * np.rint(delta / cell), axis=-1)
+            if np.any((a != b) & (distances < ob_cutoff)):
+                retained.add(frozenset((i, j)))
+    return retained
 
-    # Try to create new bonds from create_mask
-    idxs = np.transpose(np.nonzero(create_mask))
-    for i, j in idxs:
-        if i >= j:
-            continue
-        b = frozenset((i, j))
-        if b in bonds:
-            continue
-        # If OB chemical filtering is needed, require that Si_i and Si_j each have nearby OB images
-        # and that there exists a pair with OB-OB distance < ob_cutoff
-        if ob_tree is not None and ob_tree.n > 0:
-            # Use tiled KDTree to query OB near each Si in the tiled space, returning tiled indices
-            # Note: tiled_idx maps tiled index -> original OB index (not needed here unless deduplication is needed)
-            si_i_pos = Si_pos[i]
-            si_j_pos = Si_pos[j]
-            ob_neighbors_i = ob_tree.query_ball_point(si_i_pos, siob_cutoff)
-            ob_neighbors_j = ob_tree.query_ball_point(si_j_pos, siob_cutoff)
-            if len(ob_neighbors_i) == 0 or len(ob_neighbors_j) == 0:
-                # No OB support, reject bond creation
-                continue
-            connected = False
-            # Compare tiled OB Cartesian distances (tiling already applied)
-            for ti in ob_neighbors_i:
-                for tj in ob_neighbors_j:
-                    if np.linalg.norm(tiled_ob[ti] - tiled_ob[tj]) < ob_cutoff:
-                        connected = True
-                        break
-                if connected:
-                    break
-            if not connected:
-                # OB-OB filtering failed, skip creation
-                continue
-        # Passed all filters -> create bond
-        bonds.add(b)
 
-    return set(bonds)
+def build_graphs_direct(Si_pos, OB_pos, cell_vec, si_si_cutoff=SiSi_distance,
+                        ob_cutoff=OBOB_distance, siob_cutoff=SiOB_distance):
+    return _create_bonds(np.asarray(Si_pos), OB_pos, ensure_cell_vector(cell_vec),
+                         si_si_cutoff, siob_cutoff, ob_cutoff, set())
+
+
+def build_graphs_hysteresis(Si_pos, OB_pos, cell_vec, prev_bonds, sisi_cutoff=SiSi_distance,
+                            ob_cutoff=OBOB_distance, siob_cutoff=SiOB_distance,
+                            create_margin=HYSTERESIS_MARGIN):
+    si = np.asarray(Si_pos)
+    cell = ensure_cell_vector(cell_vec)
+    retained = set()
+    if prev_bonds:
+        pairs = np.array([tuple(bond) for bond in prev_bonds])
+        lengths = _mic_lengths(si[pairs[:, 0]] - si[pairs[:, 1]], cell)
+        retained.update(frozenset(pair) for pair in pairs[lengths <= sisi_cutoff + create_margin])
+    return _create_bonds(si, OB_pos, cell, sisi_cutoff - create_margin, siob_cutoff, ob_cutoff, retained)
+
 
 # ---- chunked parallel orchestration helpers ----
 
@@ -234,7 +152,7 @@ def process_chunk_build_graphs(chunk_frames,
     For each frame, call build_graphs_* to perform graph construction with hysteresis.
     """
     results = []
-    prev_bonds = set()  # Keep hysteresis within this chunk
+    prev_bonds = None  # First frame uses the direct criterion
 
     for local_idx, frame in enumerate(chunk_frames):
         # frame should be (positions, cell, time)
@@ -300,7 +218,8 @@ def get_chain_info(G):
         length = len(sub)
         degrees = [d for _, d in sub.degree()]
 
-        if any(len(c) >= 3 for c in nx.cycle_basis(sub)):
+        # A connected simple graph contains a cycle when E >= V.
+        if sum(degrees) >= 2 * length:
             key = 'cyclic'
         elif max(degrees) > 2:
             key = 'branch'
@@ -403,8 +322,9 @@ def get_rings(G):
         unique_cycles.add(_normalize_cycle(cycle))
     return unique_cycles
 
-def get_ring_info(G):
-    unique_cycles = get_rings(G)
+def get_ring_info(G, unique_cycles=None):
+    if unique_cycles is None:
+        unique_cycles = get_rings(G)
     if unique_cycles:
         cycles_sizes = [len(cycle) for cycle in unique_cycles]
         cycles_counts = {size: cycles_sizes.count(size) for size in set(cycles_sizes)}
@@ -420,13 +340,11 @@ def get_cluster_info(G):
     return max_size, mean_size, num_clusters
 
 def build_Graph_from_bonds(bonds, N):
-    # Construct adjacency matrix and graph from bond sets
-    adj = np.zeros((N, N), dtype=int)
-    for b in bonds:
-        i, j = tuple(b)
-        adj[i, j] = adj[j, i] = 1
+    graph = nx.empty_graph(N)
+    # Match the ascending neighbor order used by the ring search.
+    graph.add_edges_from(sorted(sorted(bond) for bond in bonds))
+    return graph
 
-    return nx.from_numpy_array(adj)
 
 def analyze_graph_frame(args):
     """
@@ -434,18 +352,20 @@ def analyze_graph_frame(args):
     args: (frame_index, bonds, topology)
     returns: (time, (cluster_info, qn, chain, ring))
     """
-    idx, bonds, topology = args
+    idx, bonds, topology, *options = args
     frame_data, static = topology
     G = build_Graph_from_bonds(bonds, len(static["idx_Si"]))
     # Use helper functions: get_Qn_info, get_chain_info, get_ring_info, get_cluster_info
     qn = get_Qn_info(G)
     chain = get_chain_info(G)
-    ring = get_ring_info(G)
+    cycles = get_rings(G)
+    ring = get_ring_info(G, cycles)
     max_cluster, mean_cluster, number_clusters = get_cluster_info(G)
     # Keep return format consistent with the original process_trajectory
     cluster_info = [max_cluster, mean_cluster, number_clusters]  # The last components (e.g. amorphous) can be filled later if needed
     time = frame_data["time"]
-    return (time, (cluster_info, qn, chain, ring))
+    result = (time, (cluster_info, qn, chain, ring))
+    return (result, cycles) if options and options[0] else result
 
 def _classify_clusters_from_graph(G):
     """
@@ -482,8 +402,9 @@ def build_clusters(si_positions, cell, cutoff):
         clusters: list of sets, each being a cluster of atom indices
     """
     cell_vec = ensure_cell_vector(cell)
-    adj = get_adj_matrix(si_positions, cell_vec, cutoff)
-    G = nx.from_numpy_array(adj)
+    pairs = _nearby_pairs(np.asarray(si_positions), cell_vec, cutoff)
+    G = nx.empty_graph(len(si_positions))
+    G.add_edges_from(pairs)
 
     clusters = list(nx.connected_components(G))
     node2cluster = {}
@@ -503,7 +424,7 @@ def analyze_graph_pair_reaction(args):
     args: (idx, now_graph, next_graph, now_topology, next_topology)
     returns: (time, reactions_count_dict)
     """
-    idx, now_bonds, next_bonds, now_top, next_top = args
+    idx, now_bonds, next_bonds, now_top, next_top, *cached_cycles = args
     now_frame_data, now_static = now_top
     next_frame_data, next_static = next_top
 
@@ -596,8 +517,7 @@ def analyze_graph_pair_reaction(args):
                 reactions_count['polymer_polymer'] += 1
 
     # Count ring formation: use get_rings and compare set differences
-    now_cycles = get_rings(now_G)
-    next_cycles = get_rings(next_G)
+    now_cycles, next_cycles = cached_cycles or (get_rings(now_G), get_rings(next_G))
     reactions_count['ring_formation'] = len(next_cycles - now_cycles)
 
     # time stamp: use next frame time as reference

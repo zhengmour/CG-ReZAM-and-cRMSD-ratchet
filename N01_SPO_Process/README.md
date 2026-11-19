@@ -1,66 +1,22 @@
-1. Enter data_set
-python ../scripts/expand_eight_directions.py center_gro around_gro charge
+# N01 · Fit coarse-grained interactions
 
-2. Enter data_set/refer_QM
-find ./ -name "sbatch.sh" -exec dirname {} \; > task_dirs.list
-sbatch calc_qm.sh
-```
-#!/bin/bash
-#SBATCH --job-name=
-#SBATCH --partition=
-#SBATCH --account=
-#SBATCH -N 1
-#SBATCH -n 2
-#SBATCH -c 1
+Run from `N01_SPO_Process`.
 
-MAX_JOBS=100
-DELAY=30s
-JOB_TAG="zd-qm"
+1. Set the reference-data directories, LAMMPS commands, and scheduler resources in `config/workflow.json`. Set the initial parameters in `config/elements.json`. Supply the reference RDFs and the starting LAMMPS system in the configured directories.
+2. Place completed Gaussian calculations under `data_set/refer_QM/`. To generate inputs first, run the command below for each required species pair and submit the generated `sbatch.sh` from each sample directory.
 
-while read dir; do
-    while true; do
-        running_jobs=$(squeue -u $USER -h -t RUNNING,PENDING -o "%j" | grep "${JOB_TAG}" | wc -l)
-        
-        if (( running_jobs < MAX_JOBS )); then
-            echo "Submit the task: $dir"
-            (cd "$dir" && sbatch sbatch.sh *.com >/dev/null)
-            break
-        else
-            echo "Currently running tasks: $running_jobs, waiting..."
-            sleep $DELAY
-        fi
-    done
-done < task_dirs.list
+   ```bash
+   python scripts/expand_eight_directions.py --center opt_gro/SiH.gro --around opt_gro/Na.gro --charge 1
+   ```
 
-echo "All tasks have been submitted"
-```
+3. Map the samples, index the reference data, check the inputs, and run the fit.
 
-3. Enter data_set/refer_QM -> AA2CG
-sbatch ../../script/mapping.sh task_dirs.list failed_task_dirs.list
-```
-#!/bin/bash
-#SBATCH --job-name=
-#SBATCH --partition=
-#SBATCH --account=
-#SBATCH -N 1
-#SBATCH -n 124
-#SBATCH -c 1
+   ```bash
+   bash scripts/mapping.sh --workers 8
+   python scripts/solve_CG.py
+   python optimize_main.py --check
+   python optimize_main.py --prepare
+   python optimize_main.py --run
+   ```
 
-MAX_JOBS=124
-FAILED_FILE=$2
-
-cat $1 | xargs -P $MAX_JOBS -I {} bash -c 'if python ../../scripts/map_QM_to_CG.py {} ../refer_CG 2>&1; then
-        echo "[succeed] {}"
-    else
-        echo "[failed] {}"
-        echo "{}" >> "$0"
-    fi
-' "$FAILED_FILE"
-```
-
-4. Enter data_set/refer_CG
-cp ../refer_QM/task_dirs.list all_data_dirs.list 
-python ../../script/solve_CG.py  =>  generate all_energy_files.txt and all_force_files.txt
-
-5. Enter main directoryrectory
-python optimize_main.py 64 1
+4. To continue a checkpointed fit, use `python optimize_main.py --run --resume`. Transfer the fitted interactions and scaling factor from `results/spo_run/optimized_params.json` to N02, converting units for GROMACS.

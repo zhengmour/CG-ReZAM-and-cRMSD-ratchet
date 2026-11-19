@@ -1,41 +1,116 @@
 {
     "Simulation_Type": "CGMD",
-    "Simulation_Parameters" : {
-        "niterations" : 100,
-        "init_iter" : 0,
-        "init_time" : 0,
-        "time_step" : 0.2, 
-        "nvt_steps" : 20000,
-        "npt_steps" : 0,
-        "occurred_event_number" : 5,
-        "reaction_region_size"  : 7.5, 
-        "minimize_region_size"  : 9.0 
+    "Simulation_Parameters": {
+        "niterations": 100,
+        "init_iter": 0,
+        "init_time": 0,
+        "time_step": 0.2,
+        "nvt_steps": 20000,
+        "npt_steps": 0,
+        "occurred_event_number": 5,
+        "reaction_region_size": 7.5,
+        "minimize_region_size": 9.0
     },
-
-    "Thermodynamic_Parameters" : {
-        "temperature"  : 453.0,
-        "pressure"     : 200.0
+    "Thermodynamic_Parameters": {
+        "temperature": 453.0,
+        "pressure": 200.0
     },
-
-    "Enhance_Sampling" : {
+    "Enhance_Sampling": {
         "PIRMSD": {
-            "status" : true,
-            "center" : {
+            "status": true,
+            "center": {
                 "status": true,
                 "alpha": 0.25,
                 "scale_factor": 0.9
             },
-            "search_clusters" : false,
-            "k" : 50.0,
+            "search_clusters": true,
+            "cluster_min_size_exclusive": 50,
+            "k": 50.0,
             "rmsd_scale": 1.0,
-            "md_steps" : 10,
+            "md_steps": 10,
+            "branch_update_steps": 10,
             "niterations": 100,
             "relax_steps": 10000,
-            "refer_structure" :  "zsm.xyz",
+            "refer_structure": "zsm.xyz",
             "fixed_rotate": true,
-            "critical_rmsd" : 9.0,
-            "beta" : 5.0,
-            "output_iteration": 10
+            "critical_rmsd": 9.0,
+            "beta": 5.0,
+            "output_iteration": 10,
+            "boundary_score": {
+                "status": true,
+                "mismatch_cutoff": 5.0,
+                "critical_score": 0.2,
+                "convergence_score": 0.1
+            },
+            "matching_domains": {
+                "status": true,
+                "frame_acceptance": {
+                    "status": true,
+                    "policy": "three_conditions",
+                    "min_absolute_gain": 0.0001,
+                    "min_relative_gain": 0.01,
+                    "stagnation_window": 20,
+                    "stagnation_windows": 2,
+                    "stagnation_absolute_gain": 0.0001,
+                    "stagnation_relative_gain": 0.001,
+                    "candidate_confirmations": 3,
+                    "core_link_cutoff": 4.8,
+                    "core_min_rank_ratio": 0.01,
+                    "core_max_rmsd": 0.25
+                },
+                "confirmations": 3,
+                "transition_iterations": 20,
+                "min_gain": 0.005,
+                "retain_fraction": 0.9,
+                "max_alignment_loss_increase": 0.02,
+                "grid_spacing": [
+                    3.0,
+                    3.0,
+                    3.0
+                ],
+                "rienv_core": {
+                    "status": true,
+                    "enter": 0.8,
+                    "leave": 0.7,
+                    "history": 3,
+                    "min_core": 12,
+                    "link_cutoff": 4.8,
+                    "geometry_cutoff": 2.5,
+                    "rank_ratio": 0.01,
+                    "sample_interval": 10,
+                    "weight_alpha": 0.25,
+                    "weight_padding": 4.8,
+                    "provider": {
+                        "executable": "<path-to-plumed-executable>",
+                        "reference_radius": 7.2,
+                        "sigma": 0.8,
+                        "lambda_value": 200,
+                        "zeta": 3
+                    }
+                },
+                "core_voronoi": {
+                    "status": true,
+                    "initialize_samples": 3,
+                    "allow_provisional": true,
+                    "max_initial_provisional": 8,
+                    "seed_radius": 10.0,
+                    "seed_separation": 20.0,
+                    "radius_quantile": 0.9,
+                    "radius_scale": 0.8,
+                    "weight_alpha": 0.25,
+                    "birth_confirmations": 3,
+                    "growth_confirmations": 3,
+                    "retire_confirmations": 6,
+                    "merge_confirmations": 5,
+                    "assignment_confirmations": 2,
+                    "core_anchored_rematching": true,
+                    "instant_local_assignment": true
+                }
+            },
+            "mc_bias_probability_floor": 0.99,
+            "ratchet_enabled": false,
+            "bias_algorithm": "continuous",
+            "bias_potential": "linear"
         }
     }
 }

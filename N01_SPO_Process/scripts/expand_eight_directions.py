@@ -42,7 +42,7 @@ def generate_sphere(center, radius, resolution=20):
             verts.append([v1, v2, v3, v4])
     return verts
 
-def plot_molecules(a_atoms, positions, cutoff, element_props=ELEMENT_PROPERTIES, scale=0.5, bg_color='white', shell_alpha=0.2, resolution=15):
+def plot_molecules(a_atoms, positions, cutoff, element_props=ELEMENT_PROPERTIES, scale=0.5, bg_color='white', shell_alpha=0.2, resolution=15, output='A-B.png'):
     """Visualize the molecular distribution in 3D"""
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
@@ -121,7 +121,7 @@ def plot_molecules(a_atoms, positions, cutoff, element_props=ELEMENT_PROPERTIES,
         text.set_color('black')
 
     plt.title('Molecular Distribution Visualization')
-    plt.savefig("A-B.png", dpi=1200)
+    plt.savefig(output, dpi=1200)
 
 def read_gro(filename, element_props=ELEMENT_PROPERTIES):
     """Read the GRO file and return the atomic coordinates and centroid"""
@@ -284,6 +284,8 @@ def filter_positions(a_atoms, b_atoms, positions, rotations, scale=0.80, batch_s
     valid_rotations = np.concatenate(valid_rotations)
     return valid_positions, valid_rotations
 
+QM_RUNTIME=dict(cpus=32,memory="40GB",executable="g16",environment_setup=None,scratch=None)
+
 def generate_g16_input(a_atoms, b_atoms, position, rotation, charge, dir, filename):
     a_coords = a_atoms['positions']
     b_coords = np.dot(b_atoms['positions'], rotation.T) + position
@@ -293,8 +295,8 @@ def generate_g16_input(a_atoms, b_atoms, position, rotation, charge, dir, filena
     positions = np.concatenate((a_coords, b_coords), axis=0)
 
     with open(dir / f'{filename}.com', 'w') as wf:
-        wf.write(f"""%nproc=32
-%mem=40GB
+        wf.write(f"""%nprocshared={QM_RUNTIME["cpus"]}
+%mem={QM_RUNTIME["memory"]}
 %chk={filename}.chk
 #P b3lyp/6-311G** force em=gd3bj SCRF=(Solvent=Water, SMD)
 
@@ -306,46 +308,30 @@ Title: Force and Energy
             wf.write(f"{element} {position[0]} {position[1]} {position[2]}\n")
         wf.write(f"\n")
 
-    with open(dir / 'sbatch.sh', 'w') as wf:
-        wf.write(f"#!/bin/bash\n")
-        wf.write(f"#SBATCH --job-name=zd-qm-{filename}\n")
-
-        wf.write("""
-#SBATCH -N 1
-#SBATCH -n 32
-#SBATCH -c 1
-
-#TODO
-export COM_DIR=<Path of G16>
-export root=$COM_DIR
-export PATH=$root:$PATH
-source $root/bsd/g16.profile
-export GAUSS_SCRDIR=<Path of G16 tmpdir>
-export GAUSS_EXEDIR=$root
-
-start_time=$(date +%s)
-
-filename=$1
-log=${filename[@]%.*}.log
-g16 < $filename > $log
-
-end_time=$(date +%s)
-elapsed_time=$((end_time - start_time))
-
-echo "---------------------------------------------" >> ${log}
-echo "Job started at: $(date -d @$start_time)" >> ${log}
-echo "Job ended at:   $(date -d @$end_time)" >> ${log}
-echo "Total elapsed time: $elapsed_time seconds" >> ${log}
-echo "---------------------------------------------" >> ${log}
-
-echo "Gaussian job completed in $elapsed_time seconds"
-
-""")
+    import shlex
+    settings=QM_RUNTIME
+    lines=['#!/bin/bash',f'#SBATCH --job-name=spo-dft-{filename}',
+        '#SBATCH --nodes=1','#SBATCH --ntasks=1',f'#SBATCH --cpus-per-task={settings["cpus"]}',
+        'set -euo pipefail','cd '+shlex.quote(str(dir.resolve()))]
+    if settings.get('environment_setup'):lines.append('source '+shlex.quote(settings['environment_setup']))
+    if settings.get('scratch'):lines.append('export GAUSS_SCRDIR='+shlex.quote(settings['scratch']))
+    lines+=[': "${GAUSS_SCRDIR:?Set qm_generation.scratch or GAUSS_SCRDIR}"',
+        'mkdir -p -- "$GAUSS_SCRDIR"',
+        'GAUSS_SCRDIR=$(mktemp -d "$GAUSS_SCRDIR/spo-${SLURM_JOB_ID:-local}.XXXXXX")',
+        'export GAUSS_SCRDIR',
+        shlex.quote(settings['executable'])+' < '+shlex.quote(filename+'.com')+' > '+shlex.quote(filename+'.log')]
+    (dir/'sbatch.sh').write_text('\n'.join(lines)+'\n')
 
 if __name__ == '__main__':
-    center_gro = Path(sys.argv[1])
-    around_gro = Path(sys.argv[2])
-    charge = int(sys.argv[3])
+    import argparse
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+    from workflow import load_workflow
+    parser=argparse.ArgumentParser(description='Generate DFT input samples under configured qm_source')
+    parser.add_argument('--config');parser.add_argument('--center',required=True,type=Path)
+    parser.add_argument('--around',required=True,type=Path);parser.add_argument('--charge',required=True,type=int)
+    parser.add_argument('--plot',action='store_true')
+    args=parser.parse_args();cfg=load_workflow(args.config);QM_RUNTIME=cfg['qm_generation']
+    center_gro=args.center.resolve();around_gro=args.around.resolve();charge=args.charge
     N = 8
 
     center_name = center_gro.stem
@@ -369,7 +355,10 @@ if __name__ == '__main__':
     )
 
     # Perform visualizations
-    plot_molecules(center_atoms, filtered_positions, cutoff=12.0)
+    if args.plot:
+        plot_dir=Path(cfg['paths']['qm_source'])/(center_name+'-'+around_name)
+        plot_dir.mkdir(parents=True,exist_ok=True)
+        plot_molecules(center_atoms, filtered_positions, cutoff=12.0, output=plot_dir/'sampling.png')
 
     for position, rotation in zip(filtered_positions, filter_rotations):
         position_str = f"{position[0]:.4f}_{position[1]:.4f}_{position[2]:.4f}"
@@ -383,7 +372,7 @@ if __name__ == '__main__':
 
         filename = f"{center_name}-{around_name}-{position_str}-{rotation_str}"
 
-        dir = Path(f"./data_set/QM2E/{center_name}-{around_name}/{filename}")
+        dir = Path(cfg["paths"]["qm_source"])/f"{center_name}-{around_name}"/filename
         dir.mkdir(parents=True, exist_ok=True)
         generate_g16_input(center_atoms, around_atoms, position, rotation, charge, dir, filename)
 

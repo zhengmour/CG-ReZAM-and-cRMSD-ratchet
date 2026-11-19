@@ -26,8 +26,8 @@ DispCorr = EnerPres
 rvdw-switch		 = 1.0
 rlist			 = 1.2
 
-freezegrps              = SI TPA 
-freezedim               = Y Y Y Y Y Y
+freezegrps              = SI
+freezedim               = Y Y Y
 
 ;constraints = none
 ;constraint_algorithm = LINCS

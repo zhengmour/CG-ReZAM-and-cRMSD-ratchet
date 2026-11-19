@@ -4,8 +4,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import KDTree
 
-SIV_DQ = "related to RSi model"
-SIV_VQ = "related to RSi model"
+SIV_DQ = 1.03171  # Si-SP bond length in jobs/module_files/lmp_qm.in
+SIV_VQ = 2.32650 - SIV_DQ  # opposite Si-VS radius from SP-VS bond length
 
 # OH OB ON => SP
 atom_types = {
@@ -44,60 +44,72 @@ angle_types = {
 }
 
 def parse_gaussian_output(log_file):
-    # Mapping of atomic types to element symbols
-    atom_type_map = {
-         1: 'H',   2: 'He',  6: 'C',   7: 'N',  8: 'O', 
-         9: 'F',  11: 'Na', 14: 'Si', 15: 'P', 16: 'S', 
-        17: 'Cl', 35: 'Br'
-    }
+    content=Path(log_file).read_text();lines=content.splitlines()
+    symbols={1:'H',6:'C',7:'N',8:'O',11:'Na',14:'Si',35:'Br'}
+    number=r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[DEde][+-]?\d+)?'
+    def val(x):return float(x.replace('D','E').replace('d','e'))
+    orientations=[];forces=[];energies=[]
+    for i,line in enumerate(lines):
+        match=re.search(r'SCF Done:.*?=\s*('+number+')',line)
+        if match:energies.append((i,val(match.group(1))))
+        if 'Standard orientation:' in line or 'Input orientation:' in line:
+            rows=[]
+            for row in lines[i+1:]:
+                cols=row.split()
+                if len(cols)==6 and cols[0].isdigit() and cols[1].isdigit():
+                    rows.append((int(cols[0]),int(cols[1]),[val(v) for v in cols[3:6]]))
+                elif rows:break
+            if rows:orientations.append((i,'Standard' in line,rows))
+        if 'Forces (Hartrees/Bohr)' in line:
+            rows=[]
+            for row in lines[i+1:]:
+                cols=row.split()
+                if len(cols)==5 and cols[0].isdigit() and cols[1].isdigit():
+                    rows.append((int(cols[0]),int(cols[1]),[val(v) for v in cols[2:5]]))
+                elif rows:break
+            if rows:forces.append((i,rows))
+    if content.rfind('Error termination')>content.rfind('Normal termination'):raise ValueError('Gaussian ended with an error')
+    if not forces or not energies:raise ValueError('No complete Gaussian energy/force evaluation')
+    position,force=forces[-1]
+    if not any('Normal termination' in line for line in lines[position:]):raise ValueError('Gaussian did not terminate normally')
+    available=[o for o in orientations if o[0]<position]
+    standard=[o for o in available if o[1]]
+    if not available:raise ValueError('No coordinates for force frame')
+    coords=(standard or available)[-1][2]
+    energy=[e for i,e in energies if i<position][-1]
+    if [(i,z) for i,z,_ in coords]!=[(i,z) for i,z,_ in force]:raise ValueError('Gaussian coordinate/force identities differ')
+    atoms=[]
+    for (_,z,x),(_,_,f) in zip(coords,force):
+        if z not in symbols:raise ValueError('Unsupported element atomic number '+str(z))
+        if not np.isfinite(x+f).all():raise ValueError('Nonfinite Gaussian data')
+        atoms.append(dict(Element=symbols[z],X=x[0],Y=x[1],Z=x[2],Fx=f[0],Fy=f[1],Fz=f[2]))
+    return atoms,energy
 
-    with open(log_file, 'r') as f:
-        content = f.read()
 
-    # Extract the SCF iteration energy
-    scf_match = re.search(r'SCF Done:\s+E\(.*?\)\s+=\s+(-?\d+\.\d+)', content)
-    energy = float(scf_match.group(1))
+def conserve_wrench(positions,initial_forces,source_positions,source_forces):
+    """Minimum correction preserving molecular net force and torque.
+
+    This fixes a declared rigid-body force projection; it is not a unique
+    atomistic-to-CG force map for arbitrary internal deformations.
+    """
+    positions=np.asarray(positions);origin=positions[0];r=positions-origin
+    target_f=np.asarray(source_forces).sum(axis=0)
+    target_t=np.cross(np.asarray(source_positions)-origin,source_forces).sum(axis=0)
+    matrix=np.zeros((6,3*len(r)))
+    for i,(x,y,z) in enumerate(r):
+        matrix[:3,3*i:3*i+3]=np.eye(3)
+        matrix[3:,3*i:3*i+3]=[[0,-z,y],[z,0,-x],[-y,x,0]]
+    initial=np.asarray(initial_forces).ravel();target=np.r_[target_f,target_t]
+    corrected=initial+np.linalg.lstsq(matrix,target-matrix@initial,rcond=1e-12)[0]
+    if not np.allclose(matrix@corrected,target,atol=1e-9,rtol=1e-9):raise ValueError('CG sites cannot represent source force/torque')
+    return corrected.reshape(-1,3)
 
 
-    # Extract the final structure coordinates
-    coord_pattern = re.compile(
-        r"Standard orientation:.*?(\n\s*-+)+"    # Match the title and any number of dividers
-        r"\s*Center.*?Type\s+X\s+Y\s+Z\s*\n"     # Match the column header rows
-        r"(\s*-+.*?\n)"                          # Match the divider
-        r"(.*?)"                                 # Match the data core area
-        r"(\n\s*-+\n)",                          # End the divider
-        re.DOTALL | re.IGNORECASE
-    )
-    coord_match = coord_pattern.search(content)
-    data_block = coord_match.group(3)
-    coordinates = []
-    for line in data_block.strip().split('\n'):
-        cols = line.split()
-        if len(cols) == 6:
-            atom_type = int(cols[1])
-            x, y, z = map(float, cols[3:6])
-            element = atom_type_map.get(atom_type, 'X')
-            coordinates.append((element, x, y, z))
-
-    # Get forces of atoms
-    force_pattern = r"^\s*\d+\s+\d+\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s*$"
-    force_match = re.findall(force_pattern, content, re.MULTILINE)
-    forces = []
-    for fx, fy, fz in force_match:
-        forces.append((float(fx), float(fy), float(fz)))
-
-    # Combine data
-    results = []
-    for (elem, x, y, z), (fx, fy, fz) in zip(coordinates, forces):
-        results.append({
-            'Element': elem,
-            'X': float(x), 'Y': float(y), 'Z': float(z),
-            'Fx': float(fx), 'Fy': float(fy), 'Fz': float(fz)
-        })
-
-    return results, energy
-
-def mapping_rules(atoms_info):
+def mapping_rules(atoms_info, si_sp=SIV_DQ, si_vs=SIV_VQ):
+    unsupported={a['Element'] for a in atoms_info}-{'Si','O','H','C','N','Na'}
+    if unsupported:raise ValueError('Unsupported AA mapping elements: '+str(sorted(unsupported)))
+    SIV_DQ,SIV_VQ=float(si_sp),float(si_vs)
+    if min(SIV_DQ,SIV_VQ)<=0:raise ValueError("Mapping radii must be positive")
     cg_atoms, cg_bonds, cg_angles = [], [], []
     cg_forces = []
 
@@ -174,10 +186,12 @@ def mapping_rules(atoms_info):
         # Verification Key Length (Tolerance±0.1Å)
         valid_o = [o_idx for o_idx, d in zip(o_indices, o_dists) if 1.5 <= d <= 1.8]
         
+        if len(valid_o)!=4:raise ValueError('Silicate mapping requires four oxygen neighbors')
+        source_positions=[si_pos];source_forces=[silica_forces[si_idx]]
         cluster = {"Si": si_idx, "O": [], "H": []}
         for o_idx in valid_o:            
             # Find O-linked H atoms (tolerance±0.1Å)
-            h_dists, h_indices = h_tree.query(oxygen_positions[o_idx], k=2)  # 最多找1个H
+            h_dists, h_indices = h_tree.query(oxygen_positions[o_idx], k=2) if hydrogen_positions.size else ([],[])  # 最多找1个H
             connected_h = [
                 h_idx for h_idx, h_d in zip(h_indices, h_dists) if 0.8 <= h_d <= 1.2
             ]
@@ -197,26 +211,31 @@ def mapping_rules(atoms_info):
         for o_idx, h_idx in zip(cluster['O'], cluster['H']):
             v_Si_O = oxygen_positions[o_idx] - si_pos
             norm_V_Si_O = v_Si_O / np.linalg.norm(v_Si_O)
-            rotate_ratio = SIV_DQ / np.linalg.norm(v_Si_O)
+            source_positions.append(oxygen_positions[o_idx])
+            source_forces.append(oxygen_forces[o_idx].copy())
 
             if h_idx is not None:
                 cg_atoms.append(('OH', molid, si_pos + norm_V_Si_O * SIV_DQ))
-                force = (oxygen_forces[o_idx]*elem_masses['O'] + hydrogen_forces[h_idx]*elem_masses['H']) / (elem_masses['O'] + elem_masses['H'])
-                force *= rotate_ratio
+                force = oxygen_forces[o_idx]+hydrogen_forces[h_idx]
+                source_positions.append(hydrogen_positions[h_idx]);source_forces.append(hydrogen_forces[h_idx])
                 cg_forces.append(force)
             else:
                 si_dists, si_indices = si_tree.query(oxygen_positions[o_idx], k=2)
                 connected_si = [si_idx for si_idx, d in zip(si_indices, si_dists) if 1.5 <= d <= 1.8]
                 if len(connected_si) == 2:
                     cg_atoms.append(('OB', molid, si_pos + norm_V_Si_O * SIV_DQ))
-                    cg_forces.append(oxygen_forces[o_idx]*0.5*rotate_ratio)
+                    cg_forces.append(oxygen_forces[o_idx]*0.5)
+                    source_forces[-1]*=.5
                     AB_indices.append(idx_copy)
                     AB_positions.append(si_pos + norm_V_Si_O * SIV_DQ)
                 else:
                     cg_atoms.append(('ON', molid, si_pos + norm_V_Si_O * SIV_DQ))
-                    cg_forces.append(oxygen_forces[o_idx]*rotate_ratio)
+                    cg_forces.append(oxygen_forces[o_idx])
             
             idx_copy += 1
+
+        cg_forces[idx-1:idx+4]=conserve_wrench([a[2] for a in cg_atoms[idx-1:idx+4]],
+            cg_forces[idx-1:idx+4],source_positions,source_forces).tolist()
 
         for o_idx, h_idx in zip(cluster['O'], cluster['H']):
             v_Si_O = oxygen_positions[o_idx] - si_pos
@@ -279,39 +298,46 @@ def mapping_rules(atoms_info):
 
         idx = len(cg_atoms) + 1
         cg_atoms.append(('N', molid, n_pos))
-        force, weight = 0.0, 0.0
+        force, weight = nitrogen_forces[n_idx].copy(), 0.0
         for c_idx in cluster['C1']:
-            force += carbon_forces[c_idx] * elem_masses['C']
+            force += carbon_forces[c_idx]
             weight += elem_masses['C']
             
             dists, neighbor_indices = h_tree.query(carbon_positions[c_idx], k=2)
             connected_h = [i for i, d in zip(neighbor_indices, dists) if 1.0 <= d <= 1.2]
             for h_idx in connected_h:
-                force += hydrogen_forces[h_idx] * elem_masses['H']
+                force += hydrogen_forces[h_idx]
                 weight += elem_masses['H']
-        cg_forces.append(force/weight)
+        cg_forces.append(force)
 
         for c2_idx, c3_idx in zip(cluster['C2'],cluster['C3']):
             force, weight = 0.0, 0.0
             center_pos = (carbon_positions[c2_idx] + carbon_positions[c3_idx]) / 2.0
             cg_atoms.append(('C', molid, center_pos))
 
-            force += (carbon_forces[c2_idx] + carbon_forces[c3_idx]) * elem_masses['C']
+            force += carbon_forces[c2_idx] + carbon_forces[c3_idx]
             weight += 2 * elem_masses['C']
 
             dists, neighbor_indices = h_tree.query(carbon_positions[c2_idx], k=2)
             connected_h = [i for i, d in zip(neighbor_indices, dists) if 1.0 <= d <= 1.2]
             for h_idx in connected_h:
-                force += hydrogen_forces[h_idx] * elem_masses['H']
+                force += hydrogen_forces[h_idx]
                 weight += elem_masses['H']
 
-            dists, neighbor_indices = h_tree.query(carbon_positions[c3_idx], k=2)
+            dists, neighbor_indices = h_tree.query(carbon_positions[c3_idx], k=3)
             connected_h = [i for i, d in zip(neighbor_indices, dists) if 1.0 <= d <= 1.2]
             for h_idx in connected_h:
-                force += hydrogen_forces[h_idx] * elem_masses['H']
+                force += hydrogen_forces[h_idx]
                 weight += elem_masses['H']
 
-            cg_forces.append(force/weight)
+            cg_forces.append(force)
+
+        carbon_ids=sorted(set(cluster['C1']+cluster['C2']+cluster['C3']))
+        hydrogen_ids=sorted({h for c in carbon_ids for h in h_tree.query_ball_point(carbon_positions[c],1.2)})
+        source_positions=[n_pos]+list(carbon_positions[carbon_ids])+list(hydrogen_positions[hydrogen_ids])
+        source_forces=[nitrogen_forces[n_idx]]+list(carbon_forces[carbon_ids])+list(hydrogen_forces[hydrogen_ids])
+        cg_forces[idx-1:idx+4]=conserve_wrench([a[2] for a in cg_atoms[idx-1:idx+4]],
+            cg_forces[idx-1:idx+4],source_positions,source_forces).tolist()
 
         bond_type = bond_types["N-C"]
         angle_type = angle_types["TPA"]
@@ -335,19 +361,26 @@ def mapping_rules(atoms_info):
 
         molid += 1
 
+    aa_positions=np.array([[a['X'],a['Y'],a['Z']] for a in atoms_info])
+    aa_forces=np.array([[a['Fx'],a['Fy'],a['Fz']] for a in atoms_info])
+    cg_positions=np.array([a[2] for a in cg_atoms])
+    if not cg_atoms or not np.allclose(np.sum(cg_forces,axis=0),aa_forces.sum(axis=0),atol=1e-9,rtol=1e-9):
+        raise ValueError('Unassigned atoms or nonconservative mapped force')
+    if not np.allclose(np.cross(cg_positions,cg_forces).sum(axis=0),np.cross(aa_positions,aa_forces).sum(axis=0),atol=1e-8,rtol=1e-8):
+        raise ValueError('Mapped molecular torque mismatch')
     return cg_atoms, cg_bonds, cg_angles, cg_forces
 
 def write_lammps_data(filename, atoms, bonds, angles, box_margin=20.0):
     coords = np.array([atom[2] for atom in atoms])
-    xlo, ylo, zlo = coords.mean(axis=0) - box_margin
-    xhi, yhi, zhi = coords.mean(axis=0) + box_margin
+    xlo, ylo, zlo = coords.min(axis=0) - box_margin
+    xhi, yhi, zhi = coords.max(axis=0) + box_margin
     
     with open(filename, 'w') as f:
         f.write("LAMMPS Data File (Generated by Script)\n\n")
         f.write(f"{len(atoms)} atoms\n")
         f.write(f"{len(bonds)} bonds\n")
         f.write(f"{len(angles)} angles\n")
-        f.write(f"{len(atom_types.keys())} atom types\n")
+        f.write(f"{max(atom_types.values())} atom types\n")
         f.write(f"{len(bond_types.keys())} bond types\n")
         f.write(f"{len(angle_types.keys())} angle types\n\n")
 
@@ -376,55 +409,38 @@ def write_lammps_data(filename, atoms, bonds, angles, box_margin=20.0):
             for i, angle in enumerate(angles, 1):
                 f.write(f"{i} {angle[0]} {angle[1]} {angle[2]} {angle[3]}\n")
 
-if __name__ == "__main__":
-
-    g16dir = Path(sys.argv[1])
-    outparentdir = Path(sys.argv[2])
-    
-    g16log = list(g16dir.glob('*.log'))[0]
-    g16name = g16log.stem
-
-    g16position = g16dir / f"{g16name}_position.xyz"
-    g16force = g16dir / f"{g16name}_force.xyz"
-    g16energy = g16dir / f"{g16name}_energy.xyz"
-
-    outdir = outparentdir / g16dir
-    outdir.mkdir(parents=True, exist_ok=True)
-    cgposition = outdir / f"{g16name}.data"
-    cgforce = outdir / f"{g16name}_force.xyz"
-    cgenergy = outdir / f"{g16name}_energy.xyz"
-    cgmapping = outdir / f"{g16name}_3d.html"
-
-    atoms_info, energy = parse_gaussian_output(g16log)
-    cg_atoms, cg_bonds, cg_angles, cg_forces = mapping_rules(atoms_info)
-
-    energy_conversion_factor = 627.509474
-    forces_conversion_factor = 627.509474 / 0.529177
-
-    atoms_number = len(atoms_info)
-    cg_atoms_number = len(cg_atoms)
-    with open(g16position, 'w') as gp_wf, \
-             open(g16force, 'w') as gf_wf, \
-             open(g16energy, 'w') as ge_wf, \
-             open(cgforce, 'w') as cf_wf, \
-             open(cgenergy, 'w') as ce_wf:
-        gp_wf.write(f"{atoms_number}\nPositions\n")
-        gf_wf.write(f"{atoms_number}\nForces\n")
-
-        cf_wf.write(f"{cg_atoms_number}\nForces\n")
-        for atom in atoms_info:
-            gp_wf.write(f"{atom['Element']} {atom['X']} {atom['Y']} {atom['Z']}\n")
-            gf_wf.write(f"{atom['Element']} {atom['Fx']} {atom['Fy']} {atom['Fz']}\n")
-        for atom, force in zip(cg_atoms, cg_forces):
-            cf_wf.write(f"{atom_types[atom[0]]} {force[0]*forces_conversion_factor} {force[1]*forces_conversion_factor} {force[2]*forces_conversion_factor}\n")    # convert to kcal/(mol.A)
-
-        ge_wf.write(f'{energy}')
-        ce_wf.write(f'{energy*energy_conversion_factor}')    # convert to kcal/mol
-
-    write_lammps_data(cgposition, cg_atoms, cg_bonds, cg_angles)
+def convert_sample(g16dir,qm_root,output_root,si_sp=SIV_DQ,si_vs=SIV_VQ):
+    g16dir=Path(g16dir).resolve();relative=g16dir.relative_to(Path(qm_root).resolve())
+    candidates=sorted(g16dir.glob('*.log'))
+    expected=g16dir/(g16dir.name+'.log')
+    if expected.is_file():log=expected
+    elif len(candidates)==1:log=candidates[0]
+    else:raise ValueError('Ambiguous Gaussian logs in '+str(g16dir))
+    name=log.stem;out=Path(output_root).resolve()/relative;out.mkdir(parents=True,exist_ok=True)
+    atoms,energy=parse_gaussian_output(log)
+    cg,bonds,angles,forces=mapping_rules(atoms,si_sp,si_vs)
+    factor=627.509474/0.529177
+    write_lammps_data(out/(name+'.data'),cg,bonds,angles)
+    (out/(name+'_energy.xyz')).write_text(str(energy*627.509474)+'\n')
+    (out/(name+'_force.xyz')).write_text(str(len(cg))+'\nForces kcal/mol/angstrom; rows follow LAMMPS atom IDs\n'+
+        ''.join('{} {} {} {}\n'.format(atom_types[a[0]],*(np.asarray(f)*factor)) for a,f in zip(cg,forces)))
+    import json
+    (out/'mapping.json').write_text(json.dumps(dict(source=str(log),si_sp=si_sp,si_vs=si_vs,
+        force_projection='group sums with minimum correction preserving molecular force and torque; virtual-site target forces zero'),indent=2)+'\n')
+    return out
 
 
-
-
-
-        
+if __name__=='__main__':
+    import argparse
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+    from workflow import load_workflow
+    parser=argparse.ArgumentParser(description='Map one Gaussian sample; raw QM inputs remain read-only')
+    parser.add_argument('sample',type=Path);parser.add_argument('--config');parser.add_argument('--qm-root',type=Path)
+    parser.add_argument('--output-root',type=Path);parser.add_argument('--si-sp',type=float);parser.add_argument('--si-vs',type=float)
+    args=parser.parse_args();cfg=load_workflow(args.config)
+    # Geometry has one source: the active QM LAMMPS template's Si-SP and SP-VS bonds.
+    template=(Path(cfg['paths']['templates'])/'lmp_qm.in').read_text()
+    bonds={int(m[0]):float(m[1]) for m in re.findall(r'^bond_coeff\s+(\d+)\s+\S+\s+([0-9.]+)',template,re.M)}
+    si_sp=args.si_sp if args.si_sp is not None else bonds[1]
+    si_vs=args.si_vs if args.si_vs is not None else bonds[2]-si_sp
+    print(convert_sample(args.sample,args.qm_root or cfg['paths']['qm_source'],args.output_root or cfg['paths']['cg_reference'],si_sp,si_vs))

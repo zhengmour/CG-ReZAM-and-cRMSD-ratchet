@@ -1,6 +1,7 @@
 #include "gene.itp"
 #include "system.itp"
 #include "stella8VS.itp"
+#include "w_cg.itp"
 
 [ system ] 
 silica condensation
