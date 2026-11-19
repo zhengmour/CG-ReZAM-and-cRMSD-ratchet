@@ -97,11 +97,11 @@ group SI type 1
 group other subtract all RSi
 neigh_modify every 1 delay 0 check yes exclude molecule/intra RSi one 10000
 
-compute T_VSi VSi temp
+compute T_VSi RSi temp
 compute T_other other temp
-fix 	shakeVSi  VSi shake 0.0001 20 1000 b 2 kbond 10000
+fix 	shakeVSi  RSi shake 0.0001 20 1000 b 2 kbond 10000
 fix_modify shakeVSi virial yes
-fix	mynvt_VSi VSi nvt temp ${T} ${T} 100.0
+fix	mynvt_VSi RSi nvt temp ${T} ${T} 100.0
 fix   mynvt_other other nvt temp ${T} ${T} 100.0 
 fix_modify mynvt_VSi temp T_VSi
 fix_modify mynvt_other temp T_other

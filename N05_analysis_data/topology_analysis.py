@@ -3,9 +3,9 @@ from topology_constants import QN_LENGTH, MAX_LENGTH, CHAIN_TYPE, CHAIN_LIST, RE
 
 def aggregate_topology_results(results, topologies):
     frame_number = len(results)
-    times = [topo[-1] for topo in topologies]
+    times = [topo[0]["time"] for topo in topologies]
 
-    cluster_infos = np.zeros((frame_number, 6))
+    cluster_infos = np.zeros((frame_number, 3))
     Qns = np.zeros((frame_number, QN_LENGTH + 1))
     chains = [np.zeros((frame_number, MAX_LENGTH)) for _ in range(CHAIN_TYPE)]
     rings = np.zeros((frame_number, MAX_LENGTH))
@@ -15,7 +15,7 @@ def aggregate_topology_results(results, topologies):
 
         for q, count in Qn_info.items():
             if q < QN_LENGTH:
-                Qns[i, q] = count / len(topologies[i][0][0])
+                Qns[i, q] = count / len(topologies[i][1]["idx_Si"])
 
         Qns[i, QN_LENGTH] = sum(j * Qns[i, j] for j in range(1, QN_LENGTH)) / 4.0
 
@@ -33,7 +33,7 @@ def aggregate_topology_results(results, topologies):
     return times, Qns, chains, rings, cluster_infos
 
 def aggregate_topology_reactions_results(results, ):
-    times = np.array([t for (t, _) in results], dtype=float) / 1000.0
+    times = np.array([t for (t, _) in results], dtype=float)
     reactions_dicts = [d for (_, d) in results]
     reactions_count = {
         key: np.array([d[key] for d in reactions_dicts])

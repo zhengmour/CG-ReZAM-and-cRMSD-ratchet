@@ -1,0 +1,12 @@
+#include "gene.itp"
+#include "system.itp"
+#include "stella8VS.itp"
+#include "w_cg.itp"
+
+[ system ] 
+silica condensation
+
+[ molecules ]
+SIV      1000
+W 	     15400
+

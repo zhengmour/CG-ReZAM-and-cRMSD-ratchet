@@ -1,26 +1,36 @@
 import numpy as np
 from pathlib import Path
 from sklearn.cluster import DBSCAN
+from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix
+from pirmsd_numerics import centered_gradient
 from collections import defaultdict
 import math
 import sys, json, re
 from lammps import lammps
 from mpi4py import MPI
 import logging
+import uuid
+from ratchet_state import RatchetState, fingerprint, commit_bundle, load_bundle, restart_input
+from matching_domains import DomainTracker, make_tracker
+from ratchet_force import RatchetForce, orthogonal_box
+from mpi_ratchet_force import DistributedRatchetForce
 
 try:
     import C_PIRMSD
+    if getattr(C_PIRMSD, "API_VERSION", 0) < 3:
+        raise ImportError("Stale C_PIRMSD binary; rebuild with this Python interpreter")
 except ImportError as e:
     print(f"✗ Import failed: {e}")
     print("Please run: python setup.py build_ext --inplace first")
     exit(1)
 
-""""
-PIRMSD_NUM structure:
-├── cluster_<ITER>.json    # clusters info (used for restart)
-├── lmp_es.lammpstrj       # final traj
-├── lmp_pirmsd.lammpstrj   # periodic dump
-└── history.log            # detailed logs including bias info
+"""
+PIRMSD_<segment>/:
+  latest.json + checkpoint_*.restart[.json]  # synchronized restart bundles
+  lmp_pirmsd_<start_iter>_<uuid>.lammpstrj    # analysis: id mol type xu yu zu
+  history.log                              # committed metric/bias observations
+  PIRMSD.log, rienv_references/             # diagnostics and active RIEnv templates
 """
 
 Stype = 1 
@@ -64,17 +74,51 @@ class PIRMSD:
         refer_structure = self._read_xyz(refer_structure_path )   # [id, type, x, y, z]
         self.refer_structure = C_PIRMSD._Sort2center(refer_structure)
         self.refer_center = self._center(self.refer_structure)
+        boundary = settings.get('boundary_score', {})
+        self.boundary_score = boundary.get('status', True)
+        self.mismatch_cutoff = float(boundary.get('mismatch_cutoff', 2.5))
+        self.critical_score = float(boundary.get('critical_score', 0.2))
+        if not np.isfinite(self.mismatch_cutoff) or self.mismatch_cutoff <= 0:
+            raise ValueError('boundary_score.mismatch_cutoff must be positive and finite')
+        if not 0 <= self.critical_score <= 1:
+            raise ValueError('boundary_score.critical_score must be in [0, 1]')
+        self.full_reference = [row for row in self.refer_structure if int(row[1]) == Stype]
+        self.boundary_atom_count = None
+        domain_settings = dict(settings.get('matching_domains', {}))
+        self.use_matching_domains = self.boundary_score and domain_settings.pop('status', True)
+        voronoi = domain_settings.get('core_voronoi', {})
+        if self.use_matching_domains and voronoi.get('status') and voronoi.get('mode', 'persistent') == 'persistent':
+            minimum_size = settings.get('cluster_min_size_exclusive', 50)
+            if isinstance(minimum_size, bool) or not isinstance(minimum_size, int) or minimum_size < 0:
+                raise ValueError('cluster_min_size_exclusive must be a nonnegative integer')
+            domain_settings['cluster_pirmsd'] = dict(min_size_exclusive=minimum_size,
+                beta=float(settings.get('beta', 5.)), reference_size=len(self.refer_structure))
+        self.domain_tracker = make_tracker(domain_settings)
+        self.reference_transition_active = False
 
         center_settings = settings.get('center', {})
         self.centerRMSD = center_settings.get('status', False)
         self.alpha = center_settings.get('alpha', 0.25)    
-        self.scale_factor = settings.get('scale_factor', 0.9)   
+        self.scale_factor = center_settings.get('scale_factor', settings.get('scale_factor', 0.9))
 
         self.search_clusters = settings.get('search_clusters', False)
         self.beta = settings.get('beta', 5.0)
 
         # ratchet / bias defaults
         self.bias_k = settings.get('bias_k', settings.get('k', 25.0)) 
+        self.mc_bias_probability_floor = settings.get('mc_bias_probability_floor', 0.)
+        self.bias_potential = settings.get('bias_potential', 'quadratic')
+        algorithm = settings.get('bias_algorithm')
+        if algorithm is not None and algorithm not in ('continuous', 'ratchet'):
+            raise ValueError('bias_algorithm must be continuous or ratchet')
+        self.ratchet_enabled = settings.get('ratchet_enabled', algorithm != 'continuous')
+        if not isinstance(self.ratchet_enabled, bool):
+            raise ValueError('ratchet_enabled must be boolean')
+        if algorithm is not None and self.ratchet_enabled != (algorithm == 'ratchet'):
+            raise ValueError('bias_algorithm conflicts with ratchet_enabled')
+        self.bias_algorithm = 'ratchet' if self.ratchet_enabled else 'continuous'
+        if self.bias_potential not in ('quadratic', 'linear'):
+            raise ValueError('bias_potential must be quadratic or linear')
         self.temperature = settings.get('temperature', None)
 
         # per-cluster data structure (list of dicts)
@@ -85,52 +129,15 @@ class PIRMSD:
 
         # historical global total RMSD for ratchet decision (not per-cluster)
         self.previous_total_rmsd = None
-        self.global_xi_min = None  # historical min of the global CV (total_rmsd)
+        self.global_xi_min = None  # mirror of the active ratchet epoch
+        self.ratchet = RatchetState()
+        self.metric_context = None
+        self.reference_signature = fingerprint(self.refer_structure)
 
     # logging file handle path
     def touch_logfile(self, base_dir):
         self.logfile = base_dir / 'history.log'
         self.logger.info(f"History log will be written to {self.logfile}")
-
-    # try to find last cluster file and last log entry to resume
-    def get_begin_iteration(self, previous_dir):
-        start_frame = 0
-        cluster_files = []
-
-        if self.logfile.exists():
-            with open(self.logfile, 'r') as rf:
-                lines = rf.readlines()
-                if lines:
-                    line = lines[-1].strip()
-                    start_frame = int(re.search(r'The (\d+) is finished', line).group(1))
-                    rmsd = re.search(r'RMSD is ([\d\.eE+-]+)', line)
-                    if rmsd:    self.previous_total_rmsd = float(rmsd.group(1))
-                    global_xi_min = re.search(r'xi_min is ([\d\.eE+-]+)', line)
-                    if global_xi_min:  self.global_xi_min = float(global_xi_min.group(1))
-            log_dir = self.logfile.parent
-
-            cluster_files = list(log_dir.glob('cluster_*.json'))
-        elif previous_dir:
-            # Find all clusters_*.json files in the same directory as logfile
-            cluster_files = list(previous_dir.glob('clusters_*.json'))
-            previous_logfile = previous_dir / 'history.log'
-            if previous_logfile.exists():
-                with open(previous_logfile, 'r') as rf:
-                    lines = rf.readlines()
-                    if lines:
-                        line = lines[-1].strip()
-                        rmsd = re.search(r'RMSD is ([\d\.eE+-]+)', line)
-                        if rmsd:    self.previous_total_rmsd = float(rmsd.group(1))
-                        global_xi_min = re.search(r'xi_min is ([\d\.eE+-]+)', line)
-                        if global_xi_min: self.global_xi_min = float(global_xi_min.group(1))
-            
-        if len(cluster_files) > 0:
-            cluster_files = sorted(cluster_files, key=lambda p: int(re.search(r'cluster_(\d+)\.json', p.name).group(1)))
-            self.read_clusters_infos(cluster_files[-1])
-            self.logger.info(f"Loaded cluster file for restart: {cluster_files[-1]}")   
-
-        self.logger.info(f"Starting from iteration {start_frame}")
-        return start_frame
 
     # ----------------------
     # IO helpers
@@ -162,36 +169,6 @@ class PIRMSD:
             return [self.array_to_list(x) for x in obj]
         return obj
 
-    def list_to_array(self, obj):
-        if isinstance(obj, list):
-            return np.array(obj)
-        elif isinstance(obj, dict):
-            return {k: self.list_to_array(v) for k, v in obj.items()}
-        return obj    
-
-    def write_clusters_infos(self, filename):
-        """
-        Save clusters so restart inherits ratchet state.
-        """
-        clusters = self.array_to_list(self.clusters)
-        for i, cluster in enumerate(clusters):
-            clusters[i]['center'] = [x for x in cluster['center']]
-            clusters[i]['indices'] = [int(i) for i in cluster['indices']]
-        if self.rank == 0:
-            with open(filename, 'w') as f:
-                json.dump(clusters, f)
-
-    def read_clusters_infos(self, filename):
-        with open(filename, 'r') as f:
-            clusters = json.load(f)
-        # convert centers back to numpy arrays and indices to numpy arrays
-        for c in clusters:
-            if isinstance(c.get('center'), list):
-                c['center'] = np.array(c['center'], dtype=float)
-            if isinstance(c.get('indices'), list):
-                c['indices'] = np.array(c['indices'], dtype=int)
-        self.clusters = self.list_to_array(clusters)
-
     # ----------------------
     # cluster detection & processing
     # ----------------------
@@ -222,8 +199,24 @@ class PIRMSD:
         Use DBSCAN to find all valid clusters and compute their centers and radii.
         Returns a list where each element is (center, radius, indices)
         """
-        distance_matrix = self._compute_periodic_distance_matrix(positions, cell)
-
+        if len(positions) == 0:
+            return []
+        # Store only radius neighbors, instead of allocating an N x N x 3 tensor.
+        wrapped = np.asarray(positions) % cell
+        tree = cKDTree(wrapped, boxsize=cell)
+        neighbors = tree.query_ball_point(wrapped, eps)
+        rows = np.repeat(np.arange(len(wrapped)), [len(n) for n in neighbors])
+        cols = np.concatenate(neighbors).astype(int)
+        delta = wrapped[rows] - wrapped[cols]
+        delta -= cell * np.round(delta / cell)
+        distances = np.maximum(np.linalg.norm(delta, axis=1), np.finfo(float).eps)
+        distance_matrix = csr_matrix((distances, (rows, cols)), shape=(len(wrapped), len(wrapped)))
+        # sklearn expects each sparse row sorted by distance, not column number.
+        for i in range(len(wrapped)):
+            a, b = distance_matrix.indptr[i:i+2]
+            order = np.argsort(distance_matrix.data[a:b], kind='stable')
+            distance_matrix.data[a:b] = distance_matrix.data[a:b][order]
+            distance_matrix.indices[a:b] = distance_matrix.indices[a:b][order]
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit(distance_matrix)
         labels = clustering.labels_
 
@@ -248,7 +241,7 @@ class PIRMSD:
             cluster_info.append((center, radius, indices))
 
         if not cluster_info:
-            return None  # No valid cluster found
+            return []  # No valid cluster found
 
         return cluster_info
 
@@ -373,9 +366,8 @@ class PIRMSD:
     def _grid_density_center(self, positions, cell, density_threshold=0.5):
         # For large datasets, FFT-based convolution is more efficient
 
-        target_grids_per_dim = np.mean(cell / GRID_SIZES)
-        target_grids_per_dim = 2 ** math.ceil(math.log2(target_grids_per_dim)) # Use power of 2 for FFT
-        n_grids = np.array([target_grids_per_dim] * 3, dtype=int)
+        n_grids = (2 ** np.ceil(np.log2(np.maximum(1, cell / GRID_SIZES)))).astype(int)
+        spacing = cell / n_grids
         
         # Initialize 3D grid counts
         grid_counts = np.zeros(n_grids)
@@ -383,20 +375,20 @@ class PIRMSD:
         # Count atoms in each grid
         for coord in positions:
             normalized_coord = coord % cell
-            grid_indices = (normalized_coord / GRID_SIZES).astype(int)
+            grid_indices = (normalized_coord / spacing).astype(int)
             grid_indices = np.minimum(grid_indices, n_grids - 1)
             grid_counts[grid_indices[0], grid_indices[1], grid_indices[2]] += 1
         
         # Create Gaussian kernel
         cluster_radius = min(cell) * 0.05
-        sigma_grids = cluster_radius / GRID_SIZES
+        sigma_grids = cluster_radius / spacing
         
         # Create Gaussian kernel in frequency domain
         kernel = self._create_3d_gaussian_kernel_fft(n_grids, sigma_grids)
         
         # Convolution via FFT (automatically handles periodic boundaries)
         grid_fft = np.fft.fftn(grid_counts)
-        kernel_fft = np.fft.fftn(kernel)
+        kernel_fft = kernel
         convolved_fft = grid_fft * kernel_fft
         density = np.real(np.fft.ifftn(convolved_fft))
 
@@ -409,11 +401,11 @@ class PIRMSD:
         center_grid = np.array(max_density_idx, dtype=float)
 
         # Convert to real-space center
-        center = (center_grid + 0.5) * GRID_SIZES
+        center = (center_grid + 0.5) * spacing
         center = center % cell
 
         cluster_volume_grids = np.sum(high_density_mask)
-        grid_volume = np.prod(GRID_SIZES)
+        grid_volume = np.prod(spacing)
         cluster_volume = cluster_volume_grids * grid_volume
         cluster_radius_volume = (3 * cluster_volume / (4 * np.pi)) ** (1/3)
 
@@ -488,6 +480,7 @@ class PIRMSD:
             if not select_atom:
                 positions = np.array([]).reshape(0, 3)
                 indices = []
+                types = []
             else:
                 positions = np.array([[atom[2], atom[3], atom[4]] for atom in select_atom])
                 positions = positions % cell  # Ensure positions are inside the periodic box
@@ -504,7 +497,8 @@ class PIRMSD:
         types = self.comm.bcast(types, root=0)
         
         if positions.size == 0:
-            return [[]]
+            self.clusters = []
+            return []
 
         if search_clusters:
             with timer("finding all clusters", self.logger):
@@ -590,7 +584,7 @@ class PIRMSD:
             cluster_radius = min(gird_density_radius, dbscan_method_radius) 
  
             # If DBSCAN center is not inside cluster, use density-based center
-            if not self.is_inside_cluster(dbscan_method_center, dbscan_method_center, cell, 0.8*cluster_radius):
+            if dbscan_method_center is None or not self.is_inside_cluster(dbscan_method_center, gird_density_center, cell, 0.8*cluster_radius):
                 cluster_center = gird_density_center
             else:
                 cluster_center = dbscan_method_center
@@ -598,7 +592,9 @@ class PIRMSD:
             # cluster_center, cluster_radius = self._dbscan_method_center(positions, cell)
             if len(self.clusters) > 0:
                 # If centroid changes significantly, reset optimization status
-                if np.linalg.norm(np.array(self.clusters[0]["center"])-cluster_center) > np.mean(GRID_SIZES):
+                delta_center = np.asarray(self.clusters[0]["center"]) - cluster_center
+                delta_center -= cell * np.round(delta_center / cell)
+                if np.linalg.norm(delta_center) > np.mean(GRID_SIZES):
                     self.clusters[0]["previous_rmsd"] = None
                     self.clusters[0]["move"] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                     self.clusters[0]["fixed_rotate"] = False
@@ -626,9 +622,7 @@ class PIRMSD:
             cluster_radius = cluster['radius']
             cluster_indices = cluster['indices']
 
-            # Snap to grid
-            cluster_center = (np.floor(cluster_center / GRID_SIZES) + 0.5) * GRID_SIZES    
-            cluster_radius = np.ceil(cluster_radius / np.mean(GRID_SIZES)) * np.mean(GRID_SIZES)
+            # Keep the measured center/radius; grid snapping creates artificial jumps.
             self.clusters[idx]['center'] = cluster_center
             self.clusters[idx]['radius'] = cluster_radius
 
@@ -657,11 +651,23 @@ class PIRMSD:
     # returns: results (list of (rmsd, move_atom, delta_rmsd) per cluster),
     #          total_rmsd (global CV), total_atoms (weighted)
     # ----------------------
-    def run(self, frame, x, types, cell):
+    def run(self, frame, x, types, cell, rienv_scores=None):
+        boundary = getattr(self, 'boundary_score', False)
+        n_total = sum(int(t) == Stype for t in types)
+        if boundary and n_total:
+            if n_total > len(self.full_reference):
+                raise ValueError('Boundary PIRMSD needs at least as many reference type-1 sites as simulated type-1 atoms; supply a larger reference')
+            if self.boundary_atom_count != n_total:
+                # Fixed across clusters/frames; never shrink to a fragment's size.
+                self.refer_structure = self.full_reference[:n_total]
+                self.refer_center = self._center(self.refer_structure)
+                self.boundary_atom_count = n_total
+        if boundary and getattr(self, 'use_matching_domains', False):
+            return self._run_domains(frame, x, types, cell, rienv_scores)
         atoms = []  # [id, type, x, y, z]
         self.logger.info(f"Loop {frame} starting")
         for idx, t in enumerate(types):
-            pos = np.array(x[3*idx:3*(idx+1)])
+            pos = np.array(x[3*idx:3*(idx+1)], dtype=float)
             pos -= cell * np.round(pos/cell)
             atoms.append([float(idx+1), float(t), pos[0], pos[1], pos[2]])   
         
@@ -673,11 +679,25 @@ class PIRMSD:
         results = []
         S_total = 0.0   # sum over clusters of (prefactor * S_cluster)
         W_total = 0.0   # sum over clusters of (prefactor * W_cluster)
+        contexts = []
+        if boundary:
+            if not n_total:
+                self.metric_context = None
+                return [], None, 0.0
+            # All excluded/noise atoms have unit cost in the global population.
+            S_total = float(n_total - sum(len(atoms) for atoms in solve_atoms))
+            W_total = float(n_total)
         for i, solve_atom in enumerate(solve_atoms):
             cluster = self.clusters[i]
             iteration_setting = cluster.get("iteration_setting", LOOSE_ITERTION_SETTING)
             with timer(f"Processing cluster {i}", self.logger):
-                if self.centerRMSD:
+                if boundary:
+                    rmsd, move_atom, move = C_PIRMSD._BFGS_BOUNDARY(
+                        self.refer_structure, solve_atom,
+                        iteration_setting[0], iteration_setting[1], iteration_setting[2],
+                        cluster.get("move", [0.0]*6), cluster.get("fixed_rotate", False),
+                        self.mismatch_cutoff, self.comm.py2f())
+                elif self.centerRMSD:
                     rmsd, move_atom, move = C_PIRMSD._BFGS_CENTER(
                         self.refer_structure,
                         solve_atom,
@@ -708,48 +728,160 @@ class PIRMSD:
             cluster["previous_rmsd"] = rmsd
             
             # fixed rotate threshold
-            cluster["fixed_rotate"] = True if rmsd < self.critical_rmsd else False
+            threshold = self.critical_score if boundary else self.critical_rmsd
+            cluster["fixed_rotate"] = bool(self.fixed_rotate and rmsd < threshold) if boundary else rmsd < threshold
             
-            # compute per-cluster prefactor (sigmoid of number of matched atoms)
-            n_atoms_cluster = len(move_atom) if move_atom else 0
-            prefactor = self._sigmoid(n_atoms_cluster, len(self.refer_structure), self.beta)
-
-            # compute W_cluster = sum of per-atom weights; assume MOVE_ATOM entries include weight at index 8
-            if move_atom:
-                # robust handling: some MOVE_ATOM formats may not include weight; try-except
-                try:
-                    W_cluster = sum(float(entry[8]) for entry in move_atom)
-                except Exception:
-                    # fallback: use number of matched atoms if weight not present (legacy)
-                    W_cluster = float(n_atoms_cluster)
+            n_atoms_cluster = len(move_atom)
+            if boundary:
+                # L_c = (missing slots + matched bounded losses) / N.
+                # xi^2 = noise/N + sum_c (n_c/N)*L_c.
+                prefactor = len(solve_atom) / n_total
+                W_cluster = float(n_total)
+                S_total += prefactor * rmsd*rmsd * W_cluster
             else:
-                W_cluster = 0.0            
-            
-            # compute S_cluster from returned rmsd (rmsd^2 = S_cluster / W_cluster => S_cluster = rmsd^2 * W_cluster)
-            S_cluster = (rmsd * rmsd) * W_cluster
-
-            # aggregate (apply cluster-level prefactor)
-            S_total += prefactor * S_cluster
-            W_total += prefactor * W_cluster
-
+                prefactor = self._sigmoid(n_atoms_cluster, len(self.refer_structure), self.beta)
+                W_cluster = sum(float(entry[8]) for entry in move_atom)
+                S_total += prefactor * rmsd*rmsd * W_cluster
+                W_total += prefactor * W_cluster
             cluster['prefactor'] = prefactor
             cluster['W_cluster'] = W_cluster
 
-            # keep results but do NOT modify move_atom in-place            
+            # Ordered matched IDs encode the greedy reference-site assignment.
+            # Weight values vary with coordinates, but their defining radius/alpha
+            # must stay fixed for historical values to be comparable.
+            relative = np.asarray(solve_atom)[:, 2:5] - np.asarray(solve_atom)[0, 2:5]
+            image_chart = np.rint(relative / cell).astype(int).tolist()
+            contexts.append(dict(
+                image_chart=image_chart,
+                members=sorted(int(atom[0]) for atom in solve_atom),
+                mapping=([(int(entry[9]), int(entry[0])) for entry in move_atom] if boundary else [int(entry[0]) for entry in move_atom]),
+                move=list(move), radius=float(cluster['radius']*self.scale_factor) if self.centerRMSD and not boundary else None,
+                alpha=float(self.alpha) if self.centerRMSD and not boundary else None,
+                prefactor=float(prefactor)))
+            # Chain rule for _coincide: every atom contributes to the moving centroid.
+            move_atom = centered_gradient(move_atom, solve_atom)
             results.append((rmsd, move_atom, delta_rmsd))
             
             self.clusters[i] = cluster
             self.logger.info(f"Loop {frame} cluster {i}: rmsd={rmsd:.6e}, ΔRMSD={delta_rmsd:.6e}, n_atoms={n_atoms_cluster}, prefactor={prefactor:.3f}, W_cluster={W_cluster:.6e}")
 
-        # finalize global weighted rmsd (xi)
-        W_total_safe = max(W_total, 1e-30)
-        total_rmsd = math.sqrt(S_total / W_total_safe)
+        # No observations is an undefined metric, never a perfect match.
+        if (not boundary and not results) or W_total <= 1e-30 or not np.isfinite([S_total, W_total]).all():
+            self.metric_context = None
+            return [], None, 0.0
+        total_rmsd = math.sqrt(S_total / W_total)
+        contexts.sort(key=lambda context: context['members'])
+        self.metric_context = fingerprint(dict(reference=self.reference_signature, cell=np.asarray(cell).tolist(), clusters=contexts,
+                                               metric='boundary_v1' if boundary else 'legacy_rmsd',
+                                               population=n_total if boundary else None,
+                                               cutoff=self.mismatch_cutoff if boundary else None))
+        return results, total_rmsd, W_total
 
+    def _run_domains(self, frame, x, types, cell, rienv_scores=None):
+        xyz = np.asarray(x, dtype=float).reshape(-1, 3)
+        population_ids = np.flatnonzero(np.asarray(types) == Stype)
+        n = len(population_ids)
+        if not n:
+            self.metric_context = None
+            self.reference_transition_active = False
+            return [], None, 0.0
+        if not np.isfinite(xyz).all():
+            raise ValueError('Nonfinite coordinates in matching domains')
+        if self.domain_tracker.settings.get('cluster_pirmsd'):
+            components = error = None
+            if self.rank == 0:
+                try:
+                    detected = self._dbscan_all_clusters(xyz[population_ids], cell)
+                    components = [population_ids[c[2]].tolist() for c in detected]
+                except Exception as exc:
+                    error = str(exc)
+            error, components = self.comm.bcast((error, components), root=0)
+            if error is not None:
+                raise RuntimeError('Physical cluster detection failed: ' + error)
+        elif self.domain_tracker.settings.get('core_voronoi',{}).get('status',False):
+            components = [population_ids.tolist()]  # No DBSCAN exclusion of free particles.
+        elif self.search_clusters:
+            detected = self._dbscan_all_clusters(xyz[population_ids], cell)
+            components = [population_ids[np.asarray(c[2], dtype=int)].tolist() for c in detected]
+        else:
+            components = [population_ids.tolist()]
+        core_settings = self.domain_tracker.core_selector.settings
+        if core_settings['status']:
+            interval = core_settings.get('sample_interval', 10)
+            if int(interval) != interval or interval < 1:
+                raise ValueError('RIEnv sample_interval must be a positive integer')
+            payload = None
+            if self.rank == 0:
+                try:
+                    scores = rienv_scores
+                    if scores is None and (not self.domain_tracker.core_selector.frames or frame % interval == 0):
+                        from rienv_provider import RIEnvProvider
+                        if not hasattr(self, '_rienv_provider'):
+                            directory = self.logfile.parent / 'rienv_references' if hasattr(self, 'logfile') else None
+                            self._rienv_provider = RIEnvProvider(self.full_reference,
+                                core_settings.get('provider'), directory)
+                        scores = self._rienv_provider.compute(xyz[population_ids], np.asarray(cell))
+                    payload = (None, scores)
+                except Exception as exc:
+                    payload = (str(exc), None)
+            error, rienv_scores = self.comm.bcast(payload, root=0)
+            if error:
+                raise RuntimeError('RIEnv core evaluation failed: ' + error)
+        self.domain_tracker.update(frame, xyz, cell, population_ids.tolist(), components,
+                                   self.refer_structure, self.full_reference, self.mismatch_cutoff,
+                                   C_PIRMSD, self.comm, LOOSE_ITERTION_SETTING, rienv_scores=rienv_scores)
+        results, score, weight, self.clusters = self.domain_tracker.evaluate(xyz, cell, n, self.mismatch_cutoff)
+        self.metric_context = self.domain_tracker.context(self.reference_signature, cell, self.mismatch_cutoff)
+        self.reference_transition_active = self.domain_tracker.transition is not None
+        self.logger.info('Spatial clusters=%s matching domains=%s transition=%s mix=%.6f event=%s protocol_score_work=%.9g',
+                         len(components), len(self.domain_tracker.domains), self.reference_transition_active,
+                         self.domain_tracker.last_mix, self.domain_tracker.last_event,
+                         self.domain_tracker.protocol_score_work)
+        return results, score, weight
+
+    def record_bias_iteration(self, iteration, xyz, box):
+        latest = self.force_driver.cache
+        tracker = self.domain_tracker
+        score = tracker.evaluate_global(xyz, box, len(tracker.population_ids), self.mismatch_cutoff)
+        incoming = (tracker.transition or {}).get('physical_clusters', tracker.physical_clusters)
+        with self.logfile.open('a') as stream:
+            print(f"The {iteration} is finished, the RMSD is {latest['xi']}, "
+                  f"the total weighted atoms is {latest['weight']}, the xi_min is {self.global_xi_min}, "
+                  f"valid={latest['decision']['valid']}, epoch={self.ratchet.epoch}, "
+                  f"reason={latest['decision']['reason']}, md_step={latest['key'][0]}, "
+                  f"bias_energy={latest['energy']}, metric={tracker.metric_name}, "
+                  f"cluster_eligible_Si={sum(map(len, tracker.physical_clusters))}, "
+                  f"cluster_target_Si={sum(map(len, incoming))}, cluster_pirmsd_A={latest['xi']}, "
+                  f"multidomain_pirmsd={score}", file=stream)
+
+    def checkpoint(self, lmp, directory, next_iteration, rng, signature):
+        """Collective LAMMPS write followed by a root-only atomic commit."""
+        token = self.comm.bcast(uuid.uuid4().hex if self.rank == 0 else None, root=0)
+        restart = Path(directory) / ('checkpoint_{}_{}.restart'.format(next_iteration, token))
+        lmp.command('write_restart "{}"'.format(restart.resolve()))
+        # write_restart can rebuild distributed mappings. Refresh before continuing.
+        lmp.command('run 0')
+        self.comm.Barrier()
+        if hasattr(self, 'force_driver'):self.force_driver.check()
+        self.commit_restart(directory, restart, next_iteration, rng, signature)
+
+    def commit_restart(self, directory, restart, next_iteration, rng, signature):
+        error = None
         if self.rank == 0:
-            with open(self.logfile, 'a') as logout:
-                print(f'The {frame} is finished, the RMSD is {total_rmsd}, the total weighted atoms is {W_total_safe}, the xi_min is {self.global_xi_min}', flush=True, file=logout)
+            try:
+                commit_bundle(directory, restart, dict(
+                    signature=signature, next_iteration=next_iteration,
+                    clusters=self.array_to_list(self.clusters), ratchet=self.ratchet.to_dict(),
+                    matching_domains=self.domain_tracker.state() if self.use_matching_domains else None,
+                    force_driver=self.force_driver.state() if hasattr(self, 'force_driver') else None,
+                    rng=rng.bit_generator.state,
+                    history_bytes=self.logfile.stat().st_size if self.logfile.exists() else 0))
+            except Exception as exc:
+                error = str(exc)
+        error = self.comm.bcast(error, root=0)
+        if error:
+            raise RuntimeError('Checkpoint commit failed: '+error)
 
-        return results, total_rmsd, W_total_safe
 
 if __name__ == "__main__":
     setting_file = sys.argv[1]
@@ -777,6 +909,12 @@ if __name__ == "__main__":
     md_steps = setting.get("md_steps", 10000)
     niterations = setting.get('niterations', 500)
     relax_steps = setting.get('relax_steps', 2000)
+    branch_interval = setting.get('branch_update_steps')
+    if 'branch_update_steps' in setting:
+        for name, value in [('branch_update_steps', branch_interval),
+                            ('md_steps', md_steps), ('niterations', niterations)]:
+            if type(value) is not int or value < 1:
+                raise ValueError(f'{name} must be a positive integer for single-run integration')
     rmsd_scale = setting.get('rmsd_scale', 1.0)
     output_iteration = setting.get('output_iteration', 10)
 
@@ -792,25 +930,78 @@ if __name__ == "__main__":
     logger = logging.getLogger(f"PIRMSD_{INIT_ITER}")
     logger.setLevel(logging.INFO if rank == 0 else logging.WARNING)
 
+    # Both production bias algorithms use the persistent physical-cluster CV.
+    # Older analysis backends remain available through the Python scoring API.
+    domain_options = setting.setdefault('matching_domains', {})
+    domain_options.setdefault('core_voronoi', {}).setdefault('status', True)
     pirmsd = PIRMSD(comm, setting, logger)
+    if not pirmsd.domain_tracker.settings.get('cluster_pirmsd'):
+        raise ValueError('Cluster PIRMSD bias requires boundary_score and persistent core_voronoi matching domains')
     pirmsd.temperature = setting.get('temperature', T)
     pirmsd.bias_k = setting.get('bias_k', global_k)
     pirmsd.touch_logfile(lmp_es_out_dir)
     
-    # try to resume
-    previous_dir = Path(f"./PIRMSD_{int(INIT_ITER-1)}")
-    start_iter = pirmsd.get_begin_iteration(previous_dir)
-
-    # initialize LAMMPS and dumps
-    lmp = lammps("mpi")
-    lines = open(lmpfile,'r').readlines()
-    for line in lines: 
-        line = line.replace('${T}', str(T))                                 
-        line = line.replace('${TIME_STEP}', str(TIME_STEP))    
+    # Only a committed bundle can resume the same sampling segment. A new major
+    # iteration starts a fresh ratchet instead of inheriting unmatched old logs.
+    lines = Path(lmpfile).read_text().splitlines(keepends=True)
+    signature = fingerprint(dict(metric_version=17 if pirmsd.domain_tracker.settings.get('cluster_pirmsd') else 16, bias_integrator='single_run_external_v1' if branch_interval is not None else 'per_step_external_v1', settings=setting, timestep=TIME_STEP, temperature=T,
+                                 niterations=niterations, mpi_size=size,
+                                 reference=pirmsd.reference_signature, lmp_input=lines))
+    checkpoint = load_bundle(lmp_es_out_dir, signature)
+    rng = np.random.default_rng(setting.get('seed'))
+    start_iter = 0
+    if checkpoint is not None:
+        start_iter = checkpoint['next_iteration']
+        pirmsd.clusters = checkpoint['clusters']
+        for cluster in pirmsd.clusters:
+            if 'center' in cluster:
+                cluster['center'] = np.asarray(cluster['center'])
+            if 'indices' in cluster:
+                cluster['indices'] = np.asarray(cluster['indices'], dtype=int)
+        if pirmsd.use_matching_domains:
+            if checkpoint.get('matching_domains') is None:
+                raise ValueError('Missing persistent matching-domain checkpoint state')
+            pirmsd.domain_tracker = make_tracker(pirmsd.domain_tracker.settings, checkpoint['matching_domains'])
+        pirmsd.ratchet = RatchetState(**checkpoint['ratchet'])
+        pirmsd.global_xi_min = pirmsd.ratchet.minimum
+        pirmsd.previous_total_rmsd = pirmsd.ratchet.previous
+        rng.bit_generator.state = checkpoint['rng']
+        lines = restart_input(lines, lmp_es_out_dir/checkpoint['restart'])
+        error = None
+        if rank == 0:
+            try:
+                offset = checkpoint['history_bytes']
+                if offset and (not pirmsd.logfile.exists() or pirmsd.logfile.stat().st_size < offset):
+                    raise ValueError('Committed history is missing or truncated')
+                with pirmsd.logfile.open('a+b') as stream:
+                    stream.truncate(offset)
+            except Exception as exc:
+                error = str(exc)
+        error = comm.bcast(error, root=0)
+        if error:
+            raise RuntimeError(error)
+    elif pirmsd.logfile.exists() and pirmsd.logfile.stat().st_size:
+        raise RuntimeError('Legacy history has no synchronized checkpoint; use a new PIRMSD directory')
+    comm.Barrier()
+    pirmsd.force_driver = DistributedRatchetForce(pirmsd, rng, checkpoint.get('force_driver') if checkpoint else None)
+    pirmsd.force_driver.enabled = False
+    lmp = lammps("mpi", comm=comm)
+    bias_attached = False
+    for line in lines:
+        line = line.replace('${T}', str(T)).replace('${TIME_STEP}', str(TIME_STEP))
+        if line.strip().startswith('fix ') or line.strip().startswith('fix\t'):
+            if not bias_attached:
+                pirmsd.force_driver.attach(lmp)
+                bias_attached = True
         lmp.command(line)
+    if not bias_attached:pirmsd.force_driver.attach(lmp)
+    lmp.command('run 0')
+    if checkpoint is None:
+        pirmsd.checkpoint(lmp, lmp_es_out_dir, 0, rng, signature)
 
-    lmp_pirmsd_out_dump = lmp_es_out_dir / "lmp_pirmsd.lammpstrj"
-    lmp.command(f"dump      1 all custom {md_steps*output_iteration} {lmp_pirmsd_out_dump} id mol type q xu yu zu vx vy vz") 
+    dump_token = comm.bcast(uuid.uuid4().hex if rank == 0 else None, root=0)
+    lmp_pirmsd_out_dump = lmp_es_out_dir / f"lmp_pirmsd_{start_iter}_{dump_token}.lammpstrj"
+    lmp.command(f"dump      1 all custom {md_steps*max(1, output_iteration)} {lmp_pirmsd_out_dump} id mol type xu yu zu")
     lmp.command("dump_modify 1 sort id delay 1 pbc yes")  
 
     # prepare relax input file (root)
@@ -825,150 +1016,30 @@ if __name__ == "__main__":
                 line = line.replace('${current_time}', f"{current_time:.4f}")   
                 wf.write(line)
 
-    # main sampling loop
-    for iteration in range(start_iter, niterations):
-        logger.info(f"Starting PIRMSD iteration {iteration}/{niterations}")
-        nlocal = lmp.extract_global("nlocal")
-        #nghost = lmp.extract_global("nghost")  
-        x = lmp.gather_atoms("x", 1, 3)    
-        global_types = lmp.gather_atoms("type", 0, 1)
+    pirmsd.force_driver.enabled = True
 
-        box = lmp.extract_box()   
-        lx = box[1][0] - box[0][0] 
-        ly = box[1][1] - box[0][1] 
-        lz = box[1][2] - box[0][2] 
-        cell = np.array([lx, ly, lz])
+    if branch_interval is not None:
+        from single_run_bias import run_bias_segment
+        run_bias_segment(pirmsd, lmp, lmp_es_out_dir, start_iter, niterations,
+                         md_steps, output_iteration, branch_interval, rng, signature)
+    else:
+        # main sampling loop
+        for iteration in range(start_iter, niterations):
+            logger.info(f"Starting PIRMSD iteration {iteration}/{niterations}")
+            x = lmp.gather_atoms("x", 1, 3)
+            global_types = lmp.gather_atoms("type", 0, 1)
+            pirmsd.run(iteration, x, global_types, orthogonal_box(lmp))
 
-        # compute per-cluster RMSD and global total_rmsd
-        results, total_rmsd, W_total = pirmsd.run(iteration, x, global_types, cell)
+            lmp.command(f"run {md_steps}")
+            pirmsd.force_driver.check()
+            final_xyz = np.asarray(lmp.gather_atoms('x', 1, 3)).reshape(-1, 3)
+            boxlo, boxhi = lmp.extract_box()[:2]
+            if rank == 0:
+                pirmsd.record_bias_iteration(iteration, final_xyz, np.subtract(boxhi, boxlo))
+            if (iteration+1) % max(1, output_iteration) == 0 or iteration == niterations-1:
+                pirmsd.checkpoint(lmp, lmp_es_out_dir, iteration+1, rng, signature)
 
-        # save clusters for restart occasionally
-        if output_iteration > 0 and (iteration % output_iteration == 0 or iteration == niterations - 1): 
-            pirmsd.write_clusters_infos(lmp_es_out_dir / f"cluster_{iteration}.json")
-
-        # Ratcheting decision uses ONLY the global CV = total_rmsd
-        # Broadcast a random number for Metropolis test
-        if rank == 0:
-            probability = np.random.random()
-        else:
-            probability = 0.0
-        probability = comm.bcast(probability, root=0)        
-
-        # compute Metropolis criterion based on Vb(ξ) = 1/2 k (ξ - ξ_min)^2
-        xi_current = total_rmsd
-        xi_old = pirmsd.previous_total_rmsd if hasattr(pirmsd, 'previous_total_rmsd') else xi_current
-        if pirmsd.global_xi_min is None:
-            pirmsd.global_xi_min = xi_current
-            apply_bias = True
-            reason = "init_global_xi_min"
-            deltaVb = 0.0
-        else:
-            if total_rmsd < pirmsd.global_xi_min:
-                pirmsd.global_xi_min = xi_current
-                apply_bias = True
-                reason = "downhill_new_min"
-                deltaVb = 0.0
-            else:
-                bias_k = pirmsd.bias_k
-                Vb_new = 0.5 * bias_k * (xi_current - pirmsd.global_xi_min)**2
-                Vb_old = 0.5 * bias_k * (xi_old - pirmsd.global_xi_min)**2
-                deltaVb = Vb_new - Vb_old
-
-                if pirmsd.temperature and pirmsd.temperature > 0:
-                    beta = 1.0 / (kB * pirmsd.temperature)
-                else:
-                    beta = 1.0
-
-                # Metropolis decision: only need exp when deltaVb > 0; otherwise always accept
-                if deltaVb <= 0.0:
-                    apply_bias = True
-                    reason = "downhill_apply_bias"
-                else:
-                    # Only compute probability for uphill moves (numerical stability)
-                    # In parallel environments, u should be generated on rank0 and broadcast; here is a single-node example:
-                    w = math.exp(-beta * deltaVb)  # 0 < w < 1
-                    accept = (probability < w)
-
-                    # draw/broadcasted probability 'probability' in [0,1)
-                    # Metropolis decision:
-                    #   if u < w -> accept uphill move (do NOT apply bias)
-                    #   else     -> reject uphill move (apply bias to resist the uphill)
-                    w = math.exp(-beta * deltaVb) 
-                    if accept:
-                        apply_bias = False           
-                        reason = "uphill_accepted_no_bias"
-                    else:
-                        apply_bias = True
-                        reason = "uphill_rejected_apply_bias"
-        logger.info(f"apply bias : {apply_bias}, reason is {reason}, deltaVb is {deltaVb}, w is {math.exp(-beta * deltaVb)}, probability is {probability}\n")
-
-        # update previous total rmsd for next iteration's old_xi       
-        pirmsd.previous_total_rmsd = xi_current
-
-        # If ratcheting decides to apply bias globally, we compute and apply cluster-specific bias contributions.
-        # IMPORTANT: decision is global but forces are cluster-specific.
-        if apply_bias and results:
-            xi_ref = pirmsd.global_xi_min if pirmsd.global_xi_min is not None else xi_current
-            k_bias = pirmsd.bias_k
-
-            # Scalar term: - k*(xi - xi_ref)
-            # This is the force coefficient on the reaction coordinate (multiplied by ∂ξ/∂x_i to get force on each atom)
-            scalar_global  = - k_bias * (xi_current - xi_ref)
-            dt_total = TIME_STEP * md_steps
-            
-            # Precompute denom using global xi and aggregated W_total (from above)
-            Wtot = max(W_total, 1e-30)
-            denom_global = 2.0 * xi_current * Wtot
-            logger.info(f"Added bias force with strength {scalar_global/denom_global} ")
-            
-            tags = lmp.extract_atom('id')
-            # Except for the “mass” property, the underlying storage will always be dimensioned for the range [0:nmax]. -> mass[tags[idx]]
-            # the actual usable data may be only in the range [0:nlocal] or [0:nlocal][0:dim]. 
-            mass = lmp.numpy.extract_atom('mass')
-            local_types = lmp.extract_atom('type')
-            v = lmp.extract_atom("v")
-
-            # For each cluster, compute a cluster-specific scalar from the bias potential.
-            for icluster, (cluster_rmsd, move_atom, delta_rmsd) in enumerate(results):
-                cluster = pirmsd.clusters[icluster]
-                pref_c = cluster.get('prefactor', 1.0)
-                W_cluster = cluster.get('W_cluster', None)
-        
-                for idx in range(nlocal):
-                    atom_i = tags[idx]
-                    type_i = local_types[idx]
- 
-                    if type_i != Stype:
-                        continue
-                    # find atom in move_atom list for this cluster
-                    entry = next((item for item in move_atom if int(item[0]) == atom_i), None)
-                    if entry is None:
-                        continue
-
-                    # entry layout: [id, type, dSx, dSy, dSz, dWx, dWy, dWz, weight]
-                    dS = np.array(entry[2:5], dtype=float)    # dS/dx, dS/dy, dS/dz
-                    dW = np.array(entry[5:8], dtype=float)    # dW/dx, dW/dy, dW/dz
-
-                    # gradient of global xi: prefactor multiplies numerator
-                    grad_xi = pref_c * (dS - (xi_current*xi_current) * dW) / denom_global
-
-                    # Force on atom = scalar_global * grad_xi
-                    force_vec = scalar_global * grad_xi
-
-                    # Convert to velocity impulse: Δv = (F/m) * dt_total
-                    mass_i = mass[type_i]
-
-                    delta_v = (force_vec / mass_i) * dt_total
-                    # logging.error(f"{atom_i}: {idx_atom}")
-                    v[idx][0] += delta_v[0]   
-                    v[idx][1] += delta_v[1] 
-                    v[idx][2] += delta_v[2]                      
-                            
-        lmp.command(f"run {md_steps}")
-
-    lmp_es_out_dump = lmp_es_out_dir/"lmp_es.lammpstrj"
-    lmp.command(f"dump        	es all custom 1 {lmp_es_out_dump} id mol type q xu yu zu vx vy vz") 
-    lmp.command("dump_modify 	es sort id delay 1 pbc yes")
-    lmp.command("run 0")
-    lmp.command("undump 	    es ")        
+    lmp.command('unfix '+pirmsd.force_driver.fix_id)
+    # The synchronized checkpoint retains the full MD state; lmp.data is
+    # required by subsequent relaxation/MD. No duplicate terminal trajectory.
     lmp.command("write_data lmp.data nocoeff")

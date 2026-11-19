@@ -1,6 +1,5 @@
 import re
 from multiprocessing import Pool
-import MDAnalysis as mda
 from pathlib import Path
 
 def read_gro(name):
@@ -9,6 +8,7 @@ def read_gro(name):
     List[(frame_data, static_dict)]
     Since .gro contains only one frame, this returns a list of length 1.
     """
+    import MDAnalysis as mda
     u = mda.Universe(str(name))
 
     # Follow the same selection rules as for xtc: name Si, DO*, C*, N*, Na*
@@ -67,7 +67,8 @@ def read_gro_files(traj_path: Path, n_loop: int):
     for sub in frames_lists:
         for frame_data, static in sub:
             frame_data["frame"] = iframe
-            frame_data["time"] = iframe  # .gro file has no time; temporarily use frame index instead
+            frame_data["time"] = iframe
+            frame_data["axis_unit"] = "frame"
             all_frames.append((frame_data, static))
             iframe += 1
     return all_frames
@@ -75,6 +76,7 @@ def read_gro_files(traj_path: Path, n_loop: int):
 #######################################################################################################
 
 def read_xtc_files(traj_path: Path, n_loop: int):
+    import MDAnalysis as mda
     # Read xtc files in the order of eq_cg, NPT, NVT
     topfile = traj_path/"init.gro"
 
@@ -138,291 +140,40 @@ def read_xtc_files(traj_path: Path, n_loop: int):
 
 #######################################################################################################
 
-def read_data(name):
-    try:
-        u = mda.Universe(name, topology_format="DATA")
-        ts = u.trajectory.ts  # only one frame
+def read_data(name, type_map=None):
+    import numpy as np
+    import MDAnalysis as mda
+    from lammps_io import TYPE_MAP
+    type_map=type_map or TYPE_MAP
+    u=mda.Universe(str(name),topology_format="DATA")
+    static={f'idx_{key}':u.select_atoms('type '+' '.join(map(str,value if isinstance(value,list) else [value]))).indices for key,value in type_map.items()}
+    static.update(ids=u.atoms.ids.copy(),types=u.atoms.types.copy(),molnums=None,resids=u.atoms.resids.copy())
+    if not np.allclose(u.dimensions[3:],90):raise ValueError('Only orthogonal boxes supported')
+    cell=u.dimensions[:3].copy()
+    return [(dict(frame=0,time=0,pos=np.mod(u.atoms.positions.copy(),cell),cell=cell,axis_unit='frame',source=str(name)),static)]
 
-        u_Si = u.select_atoms("type 1")
-        u_OB = u.select_atoms("type 3")
-        u_C  = u.select_atoms("type 6")
-        u_N  = u.select_atoms("type 7")
-        u_Na = u.select_atoms("type 8")
 
-        try:
-            molnums_all = u.atoms.molnums.copy()
-        except:
-            molnums_all = None   # No molnum info; later we will group by resid
-
-        static = dict(
-            idx_Si = u_Si.indices,
-            idx_OB = u_OB.indices,
-            idx_C  = u_C.indices,
-            idx_N  = u_N.indices,
-            idx_Na = u_Na.indices,
-
-            molnums = molnums_all,   # shape = (N_atoms,)
-            resids  = u.atoms.resids.copy(),    # shape = (N_atoms,)
-            resnames = u.atoms.resnames.copy(),   # e.g. 'TPA', 'RSi'
-            names   = u.atoms.names.copy(),       # atom names, e.g. 'Si', 'C1'
-        )
-
-        frame_data = dict(
-            frame = ts.frame,
-            time  = ts.time,
-            pos   = u.atoms.positions.copy(),
-            cell  = ts.dimensions[:3].copy(),
-        )
-
-        return [(frame_data, static)]
-    except Exception as e:
-        print(e)
-        return []
-    
-def read_data_files(traj_path: Path, n_loop: int):
-    traj_files = sorted(
-        [f for f in traj_path.iterdir() if f.is_file() and f.suffix in ['.lmp', '.data']],
-        key=lambda x: int(x.stem)
-    )
-    if not traj_files:
-        raise FileNotFoundError("No .lmp or .data files found")
-
-    # Each data file returns a list[frame]; here we flatten all frames into a single list
-    with Pool(n_loop) as pool:
-        frames_lists = pool.map(read_data, traj_files)
-
-    all_frames = []
-    iframe = 0
-    for sub in frames_lists:
-        for frame_data, static in sub:
-            frame_data["frame"] = iframe
-            frame_data["time"] = iframe
-            all_frames.append((frame_data, static))
-            iframe += 1
-    return all_frames
-
-#######################################################################################################
-
-def read_dump_files(traj_path: Path, n_loop: int):
-    # Load topology
-    topfile = traj_path / "lmp.data"
-    if not topfile.exists():
-        raise FileNotFoundError(f"No lmp.data topology file found in {traj_path}")
-
-    # Collect all dump / lammpstrj files
-    traj_files = sorted(
-        [f for f in traj_path.iterdir()
-         if f.is_file() and f.stem.startswith("lmp_")
-         and f.suffix in ['.dump', '.lammpstrj']],
-        key=lambda x: float(x.stem.split('_')[1])
-    )
-    times = [float(x.stem.split('_')[1]) for x in traj_files]
-    if not traj_files:
-        raise FileNotFoundError("No .dump or .lammpstrj files found")
-
-    # Use LAMMPSDUMP + Data to read
-    u = mda.Universe(
-        str(topfile),
-        [str(f) for f in traj_files],
-        format="LAMMPSDUMP",
-        # atom_style="id type xu yu zu"   # If it's x y z, change to "id type x y z" or remove
-    )
-    ts = u.trajectory.ts
-
-    # LAMMPS systems: select by type
-    u_Si = u.select_atoms("type 1")
-    u_OB = u.select_atoms("type 3")
-    u_C  = u.select_atoms("type 6")
-    u_N  = u.select_atoms("type 7")
-    u_Na = u.select_atoms("type 8")
-
-    try:
-        molnums_all = u.atoms.molnums.copy()
-    except:
-        molnums_all = None   # No molnum info; later we will group by resid
-
-    static = dict(
-        idx_Si = u_Si.indices,
-        idx_OB = u_OB.indices,
-        idx_C  = u_C.indices,
-        idx_N  = u_N.indices,
-        idx_Na = u_Na.indices,
-
-        molnums = molnums_all,   # shape = (N_atoms,)
-        resids  = u.atoms.resids.copy(),    # shape = (N_atoms,)
-    )
-
-    all_frames = []
-    iframe = 0
-    for time, ts in zip(times, u.trajectory):
-        frame_data = dict(
-            frame = iframe,
-            time  = time,
-            pos   = u.atoms.positions.copy(),
-            cell  = ts.dimensions[:3].copy(),
-        )
-        all_frames.append((frame_data, static))
-        iframe += 1
-
-    return all_frames
-
-#######################################################################################################
-
-def read_rmsd_dump(name):
-    """
-    name: e.g., /path/to/PIRMSD_1/lmp_pirmsd.lammpstrj
-    return: list[(frame_data, static_dict)]
-    """
-    traj_root = name.parent.parent          # Go back to the directory containing lmp.data
-    topfile = traj_root / "lmp.data"
-    if not topfile.exists():
-        raise FileNotFoundError(f"No lmp.data found in {traj_root}")
-
-    try:
-        u = mda.Universe(
-            str(topfile),
-            str(name),
-            format="LAMMPSDUMP")
-    except:
-        print(f"Failed to read RMSD dump file: {name}")
-        return None
-
-    u_Si = u.select_atoms("type 1")
-    u_OB = u.select_atoms("type 3")
-    u_C  = u.select_atoms("type 6")
-    u_N  = u.select_atoms("type 7")
-    u_Na = u.select_atoms("type 8")
-
-    try:
-        molnums_all = u.atoms.molnums.copy()
-    except:
-        molnums_all = None   # No molnum info; later we will group by resid
-
-    static = dict(
-        idx_Si = u_Si.indices,
-        idx_OB = u_OB.indices,
-        idx_C  = u_C.indices,
-        idx_N  = u_N.indices,
-        idx_Na = u_Na.indices,
-
-        molnums = molnums_all,   # shape = (N_atoms,)
-        resids  = u.atoms.resids.copy(),    # shape = (N_atoms,)
-    )
-
-    frames = []
-    for ts in u.trajectory:
-        frame_data = dict(
-            frame = ts.frame,
-            time  = ts.time,
-            pos   = u.atoms.positions.copy(),
-            cell  = ts.dimensions[:3].copy(),
-        )
-        frames.append((frame_data, static))
-
+def read_data_files(traj_path, n_loop, type_map=None):
+    files=sorted((p for p in Path(traj_path).iterdir() if p.suffix in ('.lmp','.data')),key=lambda p:[int(t) if t.isdigit() else t for t in re.split(r'(\d+)',p.name)])
+    if not files:raise FileNotFoundError('No .lmp/.data files')
+    frames=[]
+    for path in files:
+        frame,static=read_data(path,type_map)[0];frame['frame']=frame['time']=len(frames);frames.append((frame,static))
     return frames
 
-def read_rmsd_dump_files(traj_path: Path, n_loop: int):
-    traj_dirs = sorted(
-        [f for f in traj_path.iterdir() if f.is_dir() and f.stem.startswith("PIRMSD_")],
-        key=lambda x: float(x.stem.split('_')[1])
-    )
-    traj_files = [d / "lmp_pirmsd.lammpstrj" for d in traj_dirs]
-    traj_files = [f for f in traj_files if f.exists()]
-    if not traj_files:
-        raise FileNotFoundError("No PIRMSD_*/lmp_pirmsd.lammpstrj files found")
-    print(f"Found {len(traj_files)} PIRMSD directories")
 
-    # Each file returns list[frame]; flatten into a single list
-    with Pool(n_loop) as pool:
-        frames_lists = pool.map(read_rmsd_dump, traj_files)
+def read_dump_files(traj_path, n_loop, type_map=None, dt_fs=None):
+    from lammps_io import dump_frames
+    files=sorted((p for p in Path(traj_path).iterdir() if p.suffix in ('.dump','.lammpstrj')),key=lambda p:[int(t) if t.isdigit() else t for t in re.split(r'(\d+)',p.name)])
+    if not files:raise FileNotFoundError('No dump/lammpstrj files')
+    frames=[]
+    for path in files:frames.extend(dump_frames(path,type_map))
+    for index,(frame,_) in enumerate(frames):
+        frame['frame']=index
+        frame['time']=index;frame['axis_unit']='frame'
+    return frames
 
-    all_frames = []
-    iframe = 0
-    for sub in frames_lists:
-        if sub is None:
-            iframe += 1
-        else:
-            for frame_data, static in sub:
-                frame_data["frame"] = iframe
-                frame_data["time"] = iframe
-                all_frames.append((frame_data, static))
-                iframe += 1
-    return all_frames
 
-#######################################################################################################
-
-def read_env(name):
-    try:
-        with open(name) as f:
-            lines = f.readlines()
-        times, means, morethans = [], [], []
-        titles = lines[0].split()[2:]
-        for line in lines:
-            if line.startswith('#!'): continue
-            words = list(map(float, line.split()))
-            for i, t in enumerate(titles):
-                if t.endswith('time'):
-                    times.append(words[i])
-                elif t.endswith('.mean'):
-                    means.append(words[i])
-                elif t.endswith('.morethan'):
-                    morethans.append(words[i])
-        return (times, means, morethans)
-    except:
-        return None
-
-def read_env_files(traj_path: Path, n_loop: int):
-    files = sorted([f for f in traj_path.iterdir() if f.is_file() and f.suffix == '.COLVAR'],
-                   key=lambda x: int(x.stem))
-    if not files:
-        return None
-
-    with Pool(n_loop) as pool:
-        results = pool.map(read_env, files)
-    results = [r for r in results if r is not None]
-
-    times, means, morethans = [], [], []
-    last_time = 0
-    for t, m, mt in results:
-        times.extend([last_time + x for x in t])
-        means.extend(m)
-        morethans.extend(mt)
-        last_time = times[-1]
-
-    return [times, means, morethans]
-
-#######################################################################################################
-
-def read_rmsd(name):
-    try:
-        with open(name) as f:
-            lines = f.readlines()
-        frames, rmsds = [], []
-        for line in lines:
-            match = re.search(r"The (\d+) is finished, the RMSD is ([0-9.eE+-]+)", line)    
-            if match:
-                frames.append(int(match.group(1)))
-                rmsds.append(float(match.group(2)))
-        return (frames, rmsds)
-    except:
-        return None
-
-def read_rmsd_files(traj_path: Path, n_loop: int):
-    dirs = sorted([d for d in traj_path.iterdir() if d.is_dir() and d.stem.startswith("PIRMSD_")],
-                   key=lambda x: int(x.stem.split('_')[1]))
-    if not dirs:
-        return None
-
-    files = [d / "history.log" for d in dirs]
-    with Pool(n_loop) as pool:
-        results = pool.map(read_rmsd, files)
-    results = [r for r in results if r is not None]
-
-    frames, rmsds = [], []
-    last_frame = 0.0
-    for f, r in results:
-        frames.extend([t + last_frame for t in f])
-        rmsds.extend(r)
-        last_frame = frames[-1]
-
-    return [frames, rmsds]
+def read_rmsd_dump_files(traj_path, n_loop, type_map=None, dt_fs=None):
+    from lammps_io import read_pirmsd_dumps
+    return read_pirmsd_dumps(traj_path,type_map,dt_fs)

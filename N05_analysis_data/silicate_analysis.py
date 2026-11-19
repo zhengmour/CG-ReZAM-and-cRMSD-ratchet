@@ -1,191 +1,116 @@
-# %%
-import sys
-import numpy as np
-from multiprocessing import Pool
+"""N05 topology and N04 history analysis; inputs and outputs are explicit."""
+import argparse
+import os
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from tqdm import tqdm
+import numpy as np
+from pirmsd_io import read_pirmsd_history,write_history_csv,write_cycle_metrics
 
-from topology_constants import MAX_LENGTH, REACTIONS
-from topology_io import read_gro_files, read_xtc_files, read_data_files, read_dump_files, read_env_files, read_rmsd_files, read_rmsd_dump_files
-from topology_utils import split_indices_into_chunks, process_chunk_build_graphs, analyze_graph_frame, analyze_graph_pair_reaction
-from topology_plot import plot_qns, plot_c_qn, plot_chains, plot_rings, plot_Nrings, plot_reactions, plot_clusters, plot_rmsds, plot_envs
-from topology_analysis import aggregate_topology_results, aggregate_topology_reactions_results
-from topology_constants import SiSi_distance, OBOB_distance, SiOB_distance
 
-def main(file_type: str, n_loop: int, traj_path: str = "./"):
-    traj_path = Path(traj_path)
-    print(f"Reading {file_type} files with {n_loop} processes...")
+@contextmanager
+def output_directory(path):
+    path=Path(path).resolve();path.mkdir(parents=True,exist_ok=True);old=Path.cwd()
+    try:os.chdir(path);yield
+    finally:os.chdir(old)
 
-    # --- Step 1: Read topology files ---
-    print("Step 1: Reading topology files...")
-    if file_type == 'gro':
-        topologies = read_gro_files(traj_path, n_loop)
-    elif file_type == 'xtc':
-        topologies = read_xtc_files(traj_path, n_loop)
-    elif file_type in ['lmp', 'data']:
-        topologies = read_data_files(traj_path, n_loop)
-    elif file_type in ['dump', 'lammpstrj']:
-        topologies = read_dump_files(traj_path, n_loop)
-    elif file_type in ['rmsd_lammpstrj']:
-        topologies = read_rmsd_dump_files(traj_path, n_loop)
-    else:
-        raise ValueError(f"Unsupported file type: {file_type}")
-    print(f"Loaded {len(topologies)} frames.")
-    
-    # --- Step 2: Read environment info (COLVAR) or RMSD files if available ---
-    print("Step 2: Reading environment (COLVAR) and RMSD data...")
-    envs_result = read_env_files(traj_path, n_loop)
-    if envs_result:
-        np.savetxt("Analysis__rienv.csv", np.column_stack(envs_result), delimiter=",", header="Time, Mean, Morethan", comments='')
-        plot_envs(envs_result[0], envs_result[1], envs_result[2])
 
-    rmsds_result = read_rmsd_files(traj_path, n_loop)
-    if rmsds_result:
-        np.savetxt("Analysis__pirmsd.csv", np.column_stack(rmsds_result), delimiter=",", header="Frame, RMSD", comments='')
-        plot_rmsds(rmsds_result[0], rmsds_result[1])
-        
-    print("Environment and RMSD data processing finished.")
+def main(file_type,n_loop,traj_path='./',output=None,dt_fs=None,metrics_only=False,type_map=None):
+    if n_loop<1:raise ValueError('workers must be positive')
+    if dt_fs is not None and (not np.isfinite(dt_fs) or dt_fs<=0):raise ValueError('dt-fs must be positive')
+    if type_map is not None:
+        import json
+        type_map=json.loads(Path(type_map).resolve().read_text())
+        if set(type_map)!={'Si','OB','C','N','Na'}:raise ValueError('type-map needs Si, OB, C, N, Na')
+        assigned=[]
+        for value in type_map.values():
+            values=value if isinstance(value,list) else [value]
+            if not values or any(not isinstance(v,int) or v<1 for v in values):raise ValueError('Atom types must be positive integers')
+            assigned.extend(values)
+        if len(set(assigned))!=len(assigned):raise ValueError('Atom type selections must not overlap')
+    root=Path(traj_path).resolve();out=Path(output).resolve() if output else root/'analysis'
+    with output_directory(out):
+        return analyze(file_type,n_loop,root,dt_fs,metrics_only,type_map)
 
-    # --- Step 3.1: Topology analysis ---
-    # Number of overlapping frames at both ends of each chunk,
-    # used to maintain hysteresis continuity (>= hysteresis persistence)
-    overlap = 500
-    print(f"Step 3.1: Splitting {len(topologies)} frames into chunks for {n_loop} workers (overlap={overlap})...")
-    n_frames = len(topologies)
-    chunks = split_indices_into_chunks(n_frames, n_loop, overlap=overlap)
 
-    # Build chunk input lists: each item passed to process_chunk_build_graphs is a tuple:
-    # (chunk_frames_list, si_si_cutoff, siob_cutoff, ob_ob_cutoff)
-    chunk_inputs = []
-    for (s_ext, e_ext, s_core, e_core) in chunks:
-        # Slice topologies for this chunk (inclusive)
-        chunk_frames = topologies[s_ext:e_ext+1]
-        chunk_inputs.append((chunk_frames, SiSi_distance, SiOB_distance, OBOB_distance))
+def analyze(file_type,n_loop,root,dt_fs,metrics_only,type_map):
+    import topology_plot as plots
+    records=read_pirmsd_history(root)
+    stage_count = write_cycle_metrics(root, 'Analysis__pirmsd_stages.csv')
+    if records:
+        write_history_csv(records,'Analysis__pirmsd.csv');plots.plot_pirmsd_records(records)
+        print('Read',len(records),'PIRMSD observations; units and reference epochs retained.')
+    if metrics_only:
+        if not records and not stage_count:raise FileNotFoundError('No PIRMSD history records')
+        return
+    from multiprocessing import Pool
+    from topology_io import read_gro_files,read_xtc_files,read_data_files,read_dump_files,read_rmsd_dump_files
+    from lammps_io import TYPE_MAP
+    from topology_utils import process_chunk_build_graphs,analyze_graph_frame,analyze_graph_pair_reaction
+    from topology_analysis import aggregate_topology_results,aggregate_topology_reactions_results
+    from topology_constants import MAX_LENGTH,REACTIONS
+    types=type_map or TYPE_MAP
+    if file_type=='gro':topologies=read_gro_files(root,n_loop)
+    elif file_type=='xtc':topologies=read_xtc_files(root,n_loop)
+    elif file_type in ('lmp','data'):topologies=read_data_files(root,n_loop,types)
+    elif file_type in ('dump','lammpstrj'):topologies=read_dump_files(root,n_loop,types,dt_fs)
+    elif file_type=='rmsd_lammpstrj':topologies=read_rmsd_dump_files(root,n_loop,types,dt_fs)
+    else:raise ValueError('Unsupported file type: '+file_type)
+    if not topologies:raise ValueError('No trajectory frames')
+    for _,static in topologies:
+        if not len(static['idx_Si']) or not len(static['idx_OB']):
+            raise ValueError('Topology analysis needs Si and SP/OB sites; verify atom selections')
+    print('Loaded',len(topologies),'frames.')
+    import csv
+    with open('Analysis__frames.csv','w',newline='') as stream:
+        writer=csv.writer(stream);writer.writerow(['frame','segment','md_step','coordinate','axis_unit','source'])
+        for index,(frame,_) in enumerate(topologies):writer.writerow([index,frame.get('segment',''),frame.get('md_step',''),frame['time'],frame.get('axis_unit','ps'),frame.get('source','')])
+    unit=topologies[0][0].get('axis_unit','ps');factor=.001 if unit=='ps' else 1.
+    axis_name='Time_ns' if unit=='ps' else ('MD_step' if unit=='step' else 'Frame')
+    plots.TIME_LABEL='Time / ns (segment-local)' if unit=='ps' and file_type=='rmsd_lammpstrj' else ('Time / ns' if unit=='ps' else axis_name)
+    # Bond history must not cross independent N04 segments. A finite chunk
+    # overlap cannot guarantee exact hysteresis, so parallelize whole segments.
+    segments=[]
+    for topology in topologies:
+        key=topology[0].get('segment','trajectory')
+        if not segments or segments[-1][0]!=key:segments.append((key,[]))
+        segments[-1][1].append(topology)
+    with (Pool(n_loop) if n_loop > 1 else nullcontext()) as pool:
+        dispatch = pool.map if pool else map
+        graph_parts=dispatch(process_chunk_build_graphs,[frames for _,frames in segments])
+        graphs=[g for part in graph_parts for g in part]
+        results, cycles = zip(*dispatch(analyze_graph_frame,
+                                        [(i, graphs[i], t, True) for i, t in enumerate(topologies)]))
+    times,qns,chains,rings,clusters=aggregate_topology_results([result for _,result in results],topologies)
+    times=np.asarray(times)*factor
+    def save(name,columns,header):np.savetxt('Analysis__'+name+'.csv',np.column_stack(columns),delimiter=',',header=axis_name+','+header,comments='')
+    save('Qns',[times,qns],','.join(['Q'+str(i) for i in range(qns.shape[1]-1)]+['C']))
+    for name,data,prefix in zip(['Linear','Branch','Cyclic'],chains,['L','B','C']):save(name,[times,data],','.join(prefix+str(i+1) for i in range(MAX_LENGTH)))
+    save('Rings',[times,rings],','.join('R'+str(i+1) for i in range(MAX_LENGTH)))
+    save('Cluster',[times,clusters],'Maximum bonded cluster size (>=50 Si),Mean bonded cluster size (>=50 Si),Number of bonded clusters (>=50 Si)')
+    plots.plot_qns(times,qns);plots.plot_c_qn(qns);plots.plot_chains(times,chains)
+    plots.plot_rings(times,rings);plots.plot_Nrings(times,rings);plots.plot_clusters(times,clusters)
+    # Report counts per adjacent saved-frame interval, not physical reaction
+    # rates. Never bridge gaps between independently sampled PIRMSD segments.
+    pairs=[(i,i+1) for i in range(len(topologies)-1) if topologies[i][0].get('segment')==topologies[i+1][0].get('segment')]
+    if pairs:
+        with (Pool(n_loop) if n_loop > 1 else nullcontext()) as pool:
+            dispatch = pool.map if pool else map
+            result = list(dispatch(analyze_graph_pair_reaction,
+                                   [(k, graphs[i], graphs[j], topologies[i], topologies[j], cycles[i], cycles[j])
+                                    for k, (i, j) in enumerate(pairs)]))
+        reaction_times,counts=aggregate_topology_reactions_results(result);reaction_times*=factor
+        save('reactions',[reaction_times]+[counts[key] for key in REACTIONS],','.join(REACTIONS))
+        plots.plot_reactions(reaction_times,counts)
+    else:print('No within-segment frame pairs; reaction analysis skipped.')
+    print('Analysis complete; output:',Path.cwd())
 
-    print("Building bonds per frame within chunks (parallel)...")
-    with Pool(n_loop) as pool:
-        # Each returned item is a list of bonds-set for frames in that chunk (in the same order)
-        chunk_results = list(tqdm(pool.starmap(process_chunk_build_graphs, chunk_inputs), total=len(chunk_inputs)))
 
-    # Merge chunks: remove overlap at both ends of each chunk, keep only the core s..e segment
-    print("Merging chunk results and trimming overlaps...")
-    graphs_as_sets = []   # Final list of sets-of-frozenset pairs, one per frame in time order
-    for idx, ((s_ext, e_ext, s_core, e_core), bonds_list) in enumerate(zip(chunks, chunk_results)):
-        # bonds_list length == e_ext - s_ext + 1
-        trim_front = s_core - s_ext
-        trim_back  = e_ext - e_core
-        # slice [trim_front : len - trim_back]
-        if trim_back == 0:
-            kept = bonds_list[trim_front:]
-        else:
-            kept = bonds_list[trim_front: len(bonds_list) - trim_back]
-        graphs_as_sets.extend(kept)
-
-    # Sanity check
-    if len(graphs_as_sets) != n_frames:
-        raise RuntimeError(f"Chunk merge error: expected {n_frames} frames after merge, got {len(graphs_as_sets)}")
-
-    print(f"Built bonds for all {n_frames} frames.")
-
-    # --- Step 3.2: Aggregate analysis data ---
-    print("Step 3.2: Analyzing frames in parallel (using prebuilt graphs)...")
-    frame_args = [(i, graphs_as_sets[i], topologies[i]) for i in range(len(topologies))]
-    with Pool(n_loop) as pool:
-        frame_results = list(tqdm(pool.map(analyze_graph_frame, frame_args), total=len(frame_args)))
-    # Sort by time
-    frame_results.sort(key=lambda x: x[0])
-    # Extract results (keep consistent with original aggregate interface)
-    results = [r for (_, r) in frame_results]
-    print(f"Frame analysis completed on {len(results)} frames.")
-
-    # --- Step 3.3: Aggregate analysis data (same as before) ---
-    print("Step 3.3: Aggregating topology metrics...")
-    times, Qns, chains, rings, cluster_infos = aggregate_topology_results(results, topologies)
-    times = np.array(times) / 1000  # convert to ns
-    print("Topology aggregation finished.")
-
-    # --- Step 3.4: Save results ---
-    print("Step 3.4: Writing CSV output files...")
-    np.savetxt("Analysis__Qns.csv", np.column_stack([times, Qns]), delimiter=",", header="Time, Q0, Q1, Q2, Q3, Q4, Q5, C", comments='')
-    np.savetxt("Analysis__Linear.csv", np.column_stack([times, chains[0]]), delimiter=",", header="Time, " + ", ".join([f"L{i+1}" for i in range(MAX_LENGTH)]), comments='')
-    np.savetxt("Analysis__Branch.csv", np.column_stack([times, chains[1]]), delimiter=",", header="Time, " + ", ".join([f"B{i+1}" for i in range(MAX_LENGTH)]), comments='')
-    np.savetxt("Analysis__Cyclic.csv", np.column_stack([times, chains[2]]), delimiter=",", header="Time, " + ", ".join([f"C{i+1}" for i in range(MAX_LENGTH)]), comments='')
-    np.savetxt("Analysis__Rings.csv", np.column_stack([times, rings]), delimiter=",", header="Time, " + ", ".join([f"R{i+1}" for i in range(MAX_LENGTH)]), comments='')
-    np.savetxt("Analysis__Cluster.csv", np.column_stack([times, cluster_infos]), delimiter=",", header="Time, Maximum Cluster Size, Mean Cluster Size, Number of Clusters, Maximum Amorphous Size, Mean Amorphous Size, Number of Amorphouses", comments='')
-    print("CSV files for topology statistics saved.")
-
-    # --- Step 3.5: Plot results ---
-    print("Step 3.5: Generating topology plots...")
-    plot_qns(times, Qns)
-    plot_c_qn(Qns)
-
-    plot_chains(times, chains)
-
-    plot_rings(times, rings)
-    plot_Nrings(times, rings)
-
-    plot_clusters(times, cluster_infos)
-    print("Topology plotting finished.")
-
-    # --- Step 4.1: Reaction analysis in parallel (using prebuilt graphs, uniform time interval) ---
-    print("Step 4.1: Analyzing reactions in parallel (using prebuilt graphs)...")
-
-    # Frame times from topologies
-    frame_times = np.array([topologies[i][0]["time"] for i in range(len(topologies))], dtype=float)
-    if len(frame_times) < 2:
-        raise RuntimeError("Not enough frames for reaction analysis.")
-
-    # Use the maximum consecutive dt as the target interval
-    dt_list = np.diff(frame_times)
-    target_dt = np.max(dt_list)
-
-    # Build index pairs (i, j) so that time[j] - time[i] ~ target_dt
-    pair_indices = []
-    i = 0
-    while i < len(frame_times) - 1:
-        target_time = frame_times[i] + target_dt
-        j_candidates = np.where(frame_times >= target_time)[0]
-        j_candidates = j_candidates[j_candidates > i]
-        if len(j_candidates) == 0:
-            break
-        j = int(j_candidates[0])
-        pair_indices.append((i, j))
-        i = j
-
-    if not pair_indices:
-        raise RuntimeError("No valid frame pairs found for reaction analysis.")
-
-    pair_args = []
-    for k, (i, j) in enumerate(pair_indices):
-        pair_args.append((k, graphs_as_sets[i], graphs_as_sets[j], topologies[i], topologies[j]))
-
-    with Pool(n_loop) as pool:
-        # pair_results: list of (time, reactions_dict)
-        pair_results = list(tqdm(pool.map(analyze_graph_pair_reaction, pair_args), total=len(pair_args)))
-
-    # Sort by time (the first element of each tuple)
-    pair_results.sort(key=lambda x: x[0])
-    print(f"Reaction analysis completed on {len(pair_results)} frame pairs.")
-
-    # --- Step 4.2: Aggregate reaction metrics ---
-    print("Step 4.2: Aggregating reaction metrics...")
-    times, reactions_count = aggregate_topology_reactions_results(pair_results)
-    print("Reaction aggregation finished.")
-
-    # --- Step 4.3: Save reaction results ---
-    print("Step 4.3: Writing reaction CSV output files...")
-    row = [times] + [reactions_count[k] for k in REACTIONS.keys()]
-    header = "Time, " + ", ".join(REACTIONS.keys())
-    np.savetxt("Analysis__reactions.csv", np.column_stack(row), delimiter=",", header=header, comments='')
-    print("CSV files for reactions saved.")
-
-    # --- Step 4.4: Plot reaction results ---
-    print("Step 4.4: Generating reaction plots...")
-    plot_reactions(times, reactions_count)
-    print("All analysis and plotting finished.")
-
-if __name__ == "__main__":
-    file_type = sys.argv[1]
-    n_loop = int(sys.argv[2])
-    traj_path = sys.argv[3] if len(sys.argv) > 3 else "./"
-    main(file_type, n_loop, traj_path)
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('file_type',choices=['gro','xtc','lmp','data','dump','lammpstrj','rmsd_lammpstrj'])
+    parser.add_argument('workers',type=int,nargs='?',default=1)
+    parser.add_argument('trajectory',nargs='?',default='.')
+    parser.add_argument('--output');parser.add_argument('--dt-fs',type=float)
+    parser.add_argument('--type-map',help='JSON mapping Si/OB/C/N/Na to integer types or lists')
+    parser.add_argument('--metrics-only',action='store_true',help='Read histories only, without trajectory/topology analysis')
+    args=parser.parse_args();main(args.file_type,args.workers,args.trajectory,args.output,args.dt_fs,args.metrics_only,args.type_map)

@@ -1,0 +1,3 @@
+[submodule "scikit-opt"]
+	path = N02_GA_Process/scripts/scikit-opt
+	url = https://github.com/guofei9987/scikit-opt.git

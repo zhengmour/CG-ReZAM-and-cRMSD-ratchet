@@ -1,0 +1,69 @@
+{
+  "project_root": "..",
+  "paths": {
+    "parameters": "config/elements.json",
+    "qm_source": "data_set/refer_QM",
+    "cg_reference": "data_set/refer_CG",
+    "dataset_manifest": "data_set/refer_CG/dataset.json",
+    "templates": "jobs/module_files",
+    "rdf_reference": "jobs/refer_files",
+    "run": "results/spo_run"
+  },
+  "runtime": {
+    "backend": "slurm",
+    "python": "python",
+    "lammps_mpi": "lmp_mpi",
+    "lammps_serial": "lmp_serial",
+    "mpi_launcher": [
+      "mpiexec"
+    ],
+    "md_ranks": 64,
+    "qm_workers": 8,
+    "qm_batches": 10,
+    "environment_setup": null,
+    "partition": null,
+    "account": null,
+    "poll_seconds": 30,
+    "timeout_seconds": 86400
+  },
+  "objective": {
+    "rdf_pairs": [
+      "Si-Na",
+      "Si-C",
+      "Si-N",
+      "Na-O",
+      "C-O",
+      "N-O"
+    ],
+    "rdf_metric": "squared_l2",
+    "rdf_cutoff_angstrom": 12.0,
+    "rdf_lower_angstrom": 1.5,
+    "rdf_start_frame": -500,
+    "excluded_force_types": [
+      3
+    ],
+    "initial_weights": [
+      1.0,
+      0.1,
+      1.0
+    ],
+    "loss_floor": 1e-08
+  },
+  "optimization": {
+    "iterations": 200,
+    "sample_size": 40000,
+    "seed": 1729,
+    "step_ratio": 0.2,
+    "min_step": 0.01,
+    "relative_tolerance": 0.01,
+    "scan_workers": 3,
+    "peak_sigma_proposal": true
+  },
+  "qm_generation": {
+    "executable": "g16",
+    "environment_setup": null,
+    "scratch": null,
+    "cpus": 32,
+    "memory": "40GB"
+  }
+}
